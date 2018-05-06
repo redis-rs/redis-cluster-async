@@ -1,3 +1,5 @@
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![](http://meritbadge.herokuapp.com/redis_cluster_rs)](https://crates.io/crates/redis_cluster_rs)
+
 This is a Rust implementation for Redis cluster library.
 
 Documentation is available at [here](https://docs.rs/redis_cluster_rs/0.1.0/redis_cluster_rs/).
