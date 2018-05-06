@@ -1,0 +1,15 @@
+[package]
+name = "redis_cluster_rs"
+version = "0.1.0"
+authors = ["Atsushi Koge <atuk721@gmail.com>"]
+keywords = ["redis", "cluster", "database"]
+description = "Redis cluster driver for Rust."
+homepage = "https://github.com/atuk721/redis-cluster-rs"
+repository = "https://github.com/atuk721/redis-cluster-rs"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+crc16 = "0.3"
+rand = "0.4"
+redis = "0.8"
