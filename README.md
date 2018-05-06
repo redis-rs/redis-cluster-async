@@ -1,5 +1,7 @@
 This is a Rust implementation for Redis cluster library.
 
+Documentation is available at [here](https://docs.rs/redis_cluster_rs/0.1.0/redis_cluster_rs/).
+
 This library extends redis-rs library to be able to use cluster.
 Client impletemts traits of ConnectionLike and Commands.
 So you can use redis-rs's access methods.
