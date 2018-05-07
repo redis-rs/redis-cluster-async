@@ -72,7 +72,7 @@ impl Client {
 
         for info in self.initial_nodes.iter() {
             let addr = match *info.addr {
-                ConnectionAddr::Tcp(ref host, port) => format!("{}:{}", host, port),
+                ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
                 _ => panic!("No reach.")
             };
 
@@ -133,7 +133,6 @@ impl Connection {
             }
 
             if new_slots.len() != SLOT_SIZE {
-                println!("{}", new_slots.len());
                 return Err(RedisError::from((ErrorKind::ResponseError, "Slot refresh error.")));
             }
             new_slots
@@ -390,7 +389,7 @@ fn get_slots(connection: &redis::Connection) -> RedisResult<Vec<Slot>> {
                         } else {
                             return None;
                         };
-                        Some(format!("{}:{}", ip, port))
+                        Some(format!("redis://{}:{}", ip, port))
                     } else {
                         None
                     }
