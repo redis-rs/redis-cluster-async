@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Cursor};
 use std::iter::Iterator;
 use std::thread;
-use std::time;
+use std::time::Duration;
 
 use crc16::*;
 use rand::thread_rng;
@@ -51,6 +51,11 @@ pub struct Client {
 
 impl Client {
     /// Connect to a redis cluster server and return a cluster client.
+    /// This does not actually open a connection yet but it performs some basic checks on the URL.
+    ///
+    /// # Errors
+    ///
+    /// If it is failed to parse initial_nodes, an error is returned.
     pub fn open<T: IntoConnectionInfo>(initial_nodes: Vec<T>) -> RedisResult<Client> {
         let mut nodes = Vec::with_capacity(initial_nodes.len());
 
@@ -63,14 +68,91 @@ impl Client {
             nodes.push(info);
         }
 
-        Ok(Client {initial_nodes: nodes})
+        Ok(Client {
+            initial_nodes: nodes
+        })
     }
 
-    /// Get a Redis cluster connection.
+    /// Open and get a Redis cluster connection.
+    ///
+    /// # Errors
+    ///
+    /// If it is failed to open connections and to create slots, an error is returned.
     pub fn get_connection(&self) -> RedisResult<Connection> {
-        let mut connections = HashMap::with_capacity(self.initial_nodes.len());
+        Connection::new(self.initial_nodes.clone())
+    }
+}
 
-        for info in self.initial_nodes.iter() {
+/// This is a connection of Redis cluster.
+pub struct Connection {
+    initial_nodes: Vec<ConnectionInfo>,
+    connections: RefCell<HashMap<String, redis::Connection>>,
+    slots: RefCell<HashMap<u16, String>>,
+    auto_reconnect: RefCell<bool>
+}
+
+impl Connection {
+    fn new(initial_nodes: Vec<ConnectionInfo>) -> RedisResult<Connection> {
+        let connections = Self::create_connections(&initial_nodes)?;
+        let connection = Connection {
+            initial_nodes,
+            connections: RefCell::new(connections),
+            slots: RefCell::new(HashMap::with_capacity(SLOT_SIZE)),
+            auto_reconnect: RefCell::new(true)
+        };
+        connection.refresh_slots()?;
+
+        Ok(connection)
+    }
+
+    /// Set an auto reconnect attribute.
+    /// Default value is true;
+    pub fn set_auto_reconnect(&self, value: bool) {
+        let mut auto_reconnect = self.auto_reconnect.borrow_mut();
+        *auto_reconnect = value;
+    }
+
+    /// Sets the write timeout for the connection.
+    ///
+    /// If the provided value is `None`, then `send_packed_command` call will
+    /// block indefinitely. It is an error to pass the zero `Duration` to this
+    /// method.
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> RedisResult<()> {
+        let connections = self.connections.borrow();
+        for conn in connections.values() {
+            conn.set_write_timeout(dur)?;
+        }
+        Ok(())
+    }
+
+    /// Sets the read timeout for the connection.
+    ///
+    /// If the provided value is `None`, then `recv_response` call will
+    /// block indefinitely. It is an error to pass the zero `Duration` to this
+    /// method.
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> RedisResult<()> {
+        let connections = self.connections.borrow();
+        for conn in connections.values() {
+            conn.set_read_timeout(dur)?;
+        }
+        Ok(())
+    }
+
+    /// Check that all connections it has are available.
+    pub fn check_connection(&self) -> bool {
+        let connections = self.connections.borrow();
+        for conn in connections.values() {
+            if !check_connection(&conn) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn create_connections(initial_nodes: &Vec<ConnectionInfo>) -> RedisResult<HashMap<String, redis::Connection>> {
+        let mut connections = HashMap::with_capacity(initial_nodes.len());
+
+        for info in initial_nodes.iter() {
             let addr = match *info.addr {
                 ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
                 _ => panic!("No reach.")
@@ -82,33 +164,7 @@ impl Client {
             }
             connections.insert(addr, conn);
         }
-
-        let connection = Connection {
-            connections: RefCell::new(connections),
-            slots: RefCell::new(HashMap::with_capacity(SLOT_SIZE))
-        };
-        connection.refresh_slots()?;
-
-        Ok(connection)
-    }
-}
-
-/// This is a connection of Redis cluster.
-pub struct Connection {
-    connections: RefCell<HashMap<String, redis::Connection>>,
-    slots: RefCell<HashMap<u16, String>>
-}
-
-impl Connection {
-    /// Check that all connections it has are available.
-    pub fn check_connection(&self) -> bool {
-        let connections = self.connections.borrow();
-        for conn in connections.values() {
-            if !check_connection(&conn) {
-                return false;
-            }
-        }
-        true
+        Ok(connections)
     }
 
     // Query a node to discover slot-> master mappings.
@@ -225,10 +281,20 @@ impl Connection {
                         } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                             // Sleep and retry.
                             let sleep_time = 2u64.pow(16 - retries.max(9)) * 10;
-                            thread::sleep(time::Duration::from_millis(sleep_time));
+                            thread::sleep(Duration::from_millis(sleep_time));
                             excludes.clear();
                             continue;
                         }
+                    } else if *self.auto_reconnect.borrow() && err.kind() == ErrorKind::ResponseError {
+                        // Reconnect when ResponseError is occurred.
+                        let new_connections = Self::create_connections(&self.initial_nodes)?;
+                        {
+                            let mut connections = self.connections.borrow_mut();
+                            *connections = new_connections;
+                        }
+                        self.refresh_slots()?;
+                        excludes.clear();
+                        continue;
                     }
 
                     excludes.insert(addr);
