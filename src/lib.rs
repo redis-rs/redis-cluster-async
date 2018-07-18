@@ -36,17 +36,19 @@ use std::thread;
 use std::time::Duration;
 
 use crc16::*;
-use rand::thread_rng;
 use rand::seq::sample_iter;
-use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisError, Value, Cmd, ErrorKind};
+use rand::thread_rng;
+use redis::{
+    Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, Value,
+};
 
-pub use redis::{ConnectionLike, Commands, RedisResult};
+pub use redis::{Commands, ConnectionLike, RedisResult};
 
 const SLOT_SIZE: usize = 16384;
 
 /// This is a Redis cluster client.
 pub struct Client {
-    initial_nodes: Vec<ConnectionInfo>
+    initial_nodes: Vec<ConnectionInfo>,
 }
 
 impl Client {
@@ -63,13 +65,13 @@ impl Client {
             let info = info.into_connection_info()?;
             if let ConnectionAddr::Unix(_) = *info.addr {
                 return Err(RedisError::from((ErrorKind::InvalidClientConfig,
-                                             "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")))
+                                             "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
             }
             nodes.push(info);
         }
 
         Ok(Client {
-            initial_nodes: nodes
+            initial_nodes: nodes,
         })
     }
 
@@ -88,7 +90,7 @@ pub struct Connection {
     initial_nodes: Vec<ConnectionInfo>,
     connections: RefCell<HashMap<String, redis::Connection>>,
     slots: RefCell<HashMap<u16, String>>,
-    auto_reconnect: RefCell<bool>
+    auto_reconnect: RefCell<bool>,
 }
 
 impl Connection {
@@ -98,7 +100,7 @@ impl Connection {
             initial_nodes,
             connections: RefCell::new(connections),
             slots: RefCell::new(HashMap::with_capacity(SLOT_SIZE)),
-            auto_reconnect: RefCell::new(true)
+            auto_reconnect: RefCell::new(true),
         };
         connection.refresh_slots()?;
 
@@ -149,18 +151,23 @@ impl Connection {
         true
     }
 
-    fn create_connections(initial_nodes: &Vec<ConnectionInfo>) -> RedisResult<HashMap<String, redis::Connection>> {
+    fn create_connections(
+        initial_nodes: &Vec<ConnectionInfo>,
+    ) -> RedisResult<HashMap<String, redis::Connection>> {
         let mut connections = HashMap::with_capacity(initial_nodes.len());
 
         for info in initial_nodes.iter() {
             let addr = match *info.addr {
                 ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
-                _ => panic!("No reach.")
+                _ => panic!("No reach."),
             };
 
             let conn = connect(info.clone())?;
             if !check_connection(&conn) {
-                return Err(RedisError::from((ErrorKind::IoError, "It is failed to check startup nodes.")));
+                return Err(RedisError::from((
+                    ErrorKind::IoError,
+                    "It is failed to check startup nodes.",
+                )));
             }
             connections.insert(addr, conn);
         }
@@ -175,7 +182,9 @@ impl Connection {
         *slots = {
             let mut new_slots = HashMap::with_capacity(slots.len());
             let mut rng = thread_rng();
-            let samples = sample_iter(&mut rng, connections.values(), connections.len()).ok().unwrap();
+            let samples = sample_iter(&mut rng, connections.values(), connections.len())
+                .ok()
+                .unwrap();
 
             for conn in samples {
                 if let Ok(slots_data) = get_slots(&conn) {
@@ -189,7 +198,10 @@ impl Connection {
             }
 
             if new_slots.len() != SLOT_SIZE {
-                return Err(RedisError::from((ErrorKind::ResponseError, "Slot refresh error.")));
+                return Err(RedisError::from((
+                    ErrorKind::ResponseError,
+                    "Slot refresh error.",
+                )));
             }
             new_slots
         };
@@ -221,7 +233,11 @@ impl Connection {
         Ok(())
     }
 
-    fn get_connection<'a>(&self, connections: &'a mut HashMap<String, redis::Connection>, slot: u16) -> (String, &'a redis::Connection) {
+    fn get_connection<'a>(
+        &self,
+        connections: &'a mut HashMap<String, redis::Connection>,
+        slot: u16,
+    ) -> (String, &'a redis::Connection) {
         let slots = self.slots.borrow();
 
         if let Some(addr) = slots.get(&slot) {
@@ -232,7 +248,10 @@ impl Connection {
             // Create new connection.
             if let Ok(conn) = connect(addr.as_ref()) {
                 if check_connection(&conn) {
-                    return (addr.to_string(), connections.entry(addr.to_string()).or_insert(conn));
+                    return (
+                        addr.to_string(),
+                        connections.entry(addr.to_string()).or_insert(conn),
+                    );
                 }
             }
         }
@@ -242,8 +261,9 @@ impl Connection {
     }
 
     fn request<T, F>(&self, cmd: &[u8], func: F) -> RedisResult<T>
-        where F: Fn(&redis::Connection) -> RedisResult<T> {
-
+    where
+        F: Fn(&redis::Connection) -> RedisResult<T>,
+    {
         let mut retries = 16;
         let mut excludes = HashSet::new();
         let slot = slot_for_packed_command(cmd);
@@ -277,7 +297,6 @@ impl Connection {
                             self.refresh_slots()?;
                             excludes.clear();
                             continue;
-
                         } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                             // Sleep and retry.
                             let sleep_time = 2u64.pow(16 - retries.max(9)) * 10;
@@ -285,7 +304,9 @@ impl Connection {
                             excludes.clear();
                             continue;
                         }
-                    } else if *self.auto_reconnect.borrow() && err.kind() == ErrorKind::ResponseError {
+                    } else if *self.auto_reconnect.borrow()
+                        && err.kind() == ErrorKind::ResponseError
+                    {
                         // Reconnect when ResponseError is occurred.
                         let new_connections = Self::create_connections(&self.initial_nodes)?;
                         {
@@ -314,8 +335,15 @@ impl ConnectionLike for Connection {
         self.request(cmd, move |conn| conn.req_packed_command(cmd))
     }
 
-    fn req_packed_commands(&self, cmd: &[u8], offset: usize, count: usize) -> RedisResult<Vec<Value>> {
-        self.request(cmd, move |conn| conn.req_packed_commands(cmd, offset, count))
+    fn req_packed_commands(
+        &self,
+        cmd: &[u8],
+        offset: usize,
+        count: usize,
+    ) -> RedisResult<Vec<Value>> {
+        self.request(cmd, move |conn| {
+            conn.req_packed_commands(cmd, offset, count)
+        })
     }
 
     fn get_db(&self) -> i64 {
@@ -346,14 +374,17 @@ fn check_connection(conn: &redis::Connection) -> bool {
     }
 }
 
-fn get_random_connection<'a>(connections: &'a HashMap<String, redis::Connection>, excludes: Option<&'a HashSet<String>>) -> (String, &'a redis::Connection) {
+fn get_random_connection<'a>(
+    connections: &'a HashMap<String, redis::Connection>,
+    excludes: Option<&'a HashSet<String>>,
+) -> (String, &'a redis::Connection) {
     let mut rng = thread_rng();
     let samples = match excludes {
         Some(excludes) if excludes.len() < connections.len() => {
             let target_keys = connections.keys().filter(|key| !excludes.contains(*key));
             sample_iter(&mut rng, target_keys, 1).unwrap()
-        },
-        _ => sample_iter(&mut rng, connections.keys(), 1).unwrap()
+        }
+        _ => sample_iter(&mut rng, connections.keys(), 1).unwrap(),
     };
 
     let addr = samples.first().unwrap();
@@ -471,7 +502,7 @@ fn get_slots(connection: &redis::Connection) -> RedisResult<Vec<Slot>> {
                 start,
                 end,
                 master: nodes.pop().unwrap(),
-                replicas
+                replicas,
             });;
         }
     }
