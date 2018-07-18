@@ -1,6 +1,6 @@
 [package]
 name = "redis_cluster_rs"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Atsushi Koge <atuk721@gmail.com>"]
 keywords = ["redis", "cluster", "database"]
 description = "Redis cluster driver for Rust."
