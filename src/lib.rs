@@ -116,7 +116,7 @@ pub struct Connection {
 
 impl Connection {
     fn new(initial_nodes: Vec<ConnectionInfo>) -> RedisResult<Connection> {
-        let connections = Self::create_connections(&initial_nodes)?;
+        let connections = Self::create_initial_connections(&initial_nodes)?;
         let connection = Connection {
             initial_nodes,
             connections: RefCell::new(connections),
@@ -172,7 +172,7 @@ impl Connection {
         true
     }
 
-    fn create_connections(
+    fn create_initial_connections(
         initial_nodes: &Vec<ConnectionInfo>,
     ) -> RedisResult<HashMap<String, redis::Connection>> {
         let mut connections = HashMap::with_capacity(initial_nodes.len());
@@ -183,14 +183,19 @@ impl Connection {
                 _ => panic!("No reach."),
             };
 
-            let conn = connect(info.clone())?;
-            if !check_connection(&conn) {
-                return Err(RedisError::from((
-                    ErrorKind::IoError,
-                    "It is failed to check startup nodes.",
-                )));
+            if let Ok(conn) = connect(info.clone()) {
+                if check_connection(&conn) {
+                    connections.insert(addr, conn);
+                    break;
+                }
             }
-            connections.insert(addr, conn);
+        }
+
+        if connections.len() == 0 {
+            return Err(RedisError::from((
+                ErrorKind::IoError,
+                "It is failed to check startup nodes.",
+            )));
         }
         Ok(connections)
     }
@@ -329,7 +334,8 @@ impl Connection {
                         && err.kind() == ErrorKind::ResponseError
                     {
                         // Reconnect when ResponseError is occurred.
-                        let new_connections = Self::create_connections(&self.initial_nodes)?;
+                        let new_connections =
+                            Self::create_initial_connections(&self.initial_nodes)?;
                         {
                             let mut connections = self.connections.borrow_mut();
                             *connections = new_connections;
@@ -488,7 +494,8 @@ fn get_slots(connection: &redis::Connection) -> RedisResult<Vec<Slot>> {
                 continue;
             };
 
-            let mut nodes: Vec<String> = item.into_iter()
+            let mut nodes: Vec<String> = item
+                .into_iter()
                 .skip(2)
                 .filter_map(|node| {
                     if let Value::Bulk(node) = node {
@@ -511,8 +518,7 @@ fn get_slots(connection: &redis::Connection) -> RedisResult<Vec<Slot>> {
                     } else {
                         None
                     }
-                })
-                .collect();
+                }).collect();
 
             if nodes.len() < 1 {
                 continue;
