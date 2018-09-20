@@ -47,7 +47,8 @@
 //! ```
 extern crate crc16;
 extern crate rand;
-extern crate redis;
+
+pub extern crate redis;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
