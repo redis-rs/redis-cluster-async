@@ -519,7 +519,8 @@ fn get_slots(connection: &redis::Connection) -> RedisResult<Vec<Slot>> {
                     } else {
                         None
                     }
-                }).collect();
+                })
+                .collect();
 
             if nodes.len() < 1 {
                 continue;
