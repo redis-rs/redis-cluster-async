@@ -36,7 +36,7 @@
 //!     let client = Client::open(nodes).unwrap();
 //!     let connection = client.get_connection().unwrap();
 //!
-//!     let key = "test";
+//!     let key = "test2";
 //!
 //!     let _: () = pipe()
 //!         .rpush(key, "123").ignore()
@@ -316,6 +316,7 @@ impl Connection {
                         return Err(err);
                     }
 
+                    eprintln!("{:#?}", err);
                     if err.kind() == ErrorKind::ExtensionError {
                         let error_code = err.extension_error_code().unwrap();
 
