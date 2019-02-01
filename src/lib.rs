@@ -8,13 +8,13 @@
 //! Note that this library is currently not have features of Pubsub.
 //!
 //! # Example
-//! ```rust,no_run
+//! ```rust
 //! extern crate redis_cluster_rs;
 //!
 //! use redis_cluster_rs::{Client, Commands};
 //!
 //! fn main() {
-//!     let nodes = vec!["redis://127.0.0.1:6379/", "redis://127.0.0.1:6378/", "redis://127.0.0.1:6377/"];
+//!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!     let client = Client::open(nodes).unwrap();
 //!     let connection = client.get_connection().unwrap();
 //!
@@ -26,13 +26,13 @@
 //! ```
 //!
 //! # Pipelining
-//! ```rust,no_run
+//! ```rust
 //! extern crate redis_cluster_rs;
 //!
 //! use redis_cluster_rs::{Client, PipelineCommands, pipe};
 //!
 //! fn main() {
-//!     let nodes = vec!["redis://127.0.0.1:6379/", "redis://127.0.0.1:6378/", "redis://127.0.0.1:6377/"];
+//!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!     let client = Client::open(nodes).unwrap();
 //!     let connection = client.get_connection().unwrap();
 //!
