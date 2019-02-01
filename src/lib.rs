@@ -11,7 +11,7 @@
 //! ```rust
 //! extern crate redis_cluster_rs;
 //!
-//! use redis_cluster_rs::{Client, Commands};
+//! use redis_cluster_rs::{Client, redis::Commands};
 //!
 //! fn main() {
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
@@ -29,7 +29,7 @@
 //! ```rust
 //! extern crate redis_cluster_rs;
 //!
-//! use redis_cluster_rs::{Client, PipelineCommands, pipe};
+//! use redis_cluster_rs::{Client, redis::{PipelineCommands, pipe}};
 //!
 //! fn main() {
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
@@ -61,10 +61,9 @@ use crc16::*;
 use rand::seq::sample_iter;
 use rand::thread_rng;
 use redis::{
-    Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, Value,
+    Cmd, Commands, ConnectionAddr, ConnectionInfo, ConnectionLike, ErrorKind, IntoConnectionInfo,
+    RedisError, RedisResult, Value,
 };
-
-pub use redis::{pipe, Commands, ConnectionLike, PipelineCommands, RedisResult};
 
 const SLOT_SIZE: usize = 16384;
 
