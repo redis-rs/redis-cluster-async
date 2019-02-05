@@ -11,5 +11,9 @@ readme = "README.md"
 
 [dependencies]
 crc16 = "0.4"
+futures = "0.1"
 rand = "0.5"
 redis = "0.9"
+
+[dev-dependencies]
+tokio = "0.1"
