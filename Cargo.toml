@@ -9,6 +9,8 @@ repository = "https://github.com/atuk721/redis-cluster-rs"
 license = "MIT"
 readme = "README.md"
 
+edition = "2018"
+
 [dependencies]
 crc16 = "0.4"
 futures = "0.1"
