@@ -140,6 +140,7 @@ impl Client {
 }
 
 /// This is a connection of Redis cluster.
+#[derive(Clone)]
 pub struct Connection(mpsc::Sender<Message>);
 
 impl Connection {
