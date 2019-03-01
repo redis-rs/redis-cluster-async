@@ -9,7 +9,7 @@ use std::{
 };
 
 use {
-    proptest::proptest,
+    proptest::{prelude::*, proptest},
     tokio::{prelude::*, runtime::current_thread::Runtime},
 };
 
@@ -107,7 +107,7 @@ fn proptests() {
 
     let env = std::cell::RefCell::new(RedisEnv::new());
 
-    proptest!(|(requests in 0..15, value in 0..i32::max_value())| {
+    proptest!(ProptestConfig { cases: 50, .. Default::default() }, |(requests in 0..15, value in 0..i32::max_value())| {
         let mut env = env.borrow_mut();
         let env = &mut *env;
 
