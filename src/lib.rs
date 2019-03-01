@@ -160,12 +160,19 @@ struct Pipeline {
     futures: Vec<Request<RedisFuture<(String, RedisResult<Vec<Value>>)>, Vec<Value>>>,
 }
 
-struct Message {
+#[derive(Clone)]
+struct CmdArg {
     cmd: Vec<u8>,
+    offset: usize,
+    count: usize,
+}
+
+struct Message {
+    cmd: CmdArg,
     sender: oneshot::Sender<RedisResult<Vec<Value>>>,
     func: fn(
         redis::r#async::SharedConnection,
-        Vec<u8>,
+        CmdArg,
     ) -> RedisFuture<(redis::r#async::SharedConnection, Vec<Value>)>,
 }
 
@@ -193,11 +200,11 @@ impl fmt::Debug for ConnectionState {
 }
 
 struct RequestInfo {
-    cmd: Vec<u8>,
+    cmd: CmdArg,
     slot: Option<u16>,
     func: fn(
         redis::r#async::SharedConnection,
-        Vec<u8>,
+        CmdArg,
     ) -> RedisFuture<(redis::r#async::SharedConnection, Vec<Value>)>,
     excludes: HashSet<String>,
 }
@@ -476,7 +483,7 @@ impl Sink for Pipeline {
 
         let retries = 16;
         let excludes = HashSet::new();
-        let slot = slot_for_packed_command(&cmd);
+        let slot = slot_for_packed_command(&cmd.cmd);
 
         let info = RequestInfo {
             cmd: cmd.clone(), // TODO remove clone
@@ -557,11 +564,15 @@ impl ConnectionLike for Connection {
             self.0
                 .clone()
                 .send(Message {
-                    cmd,
+                    cmd: CmdArg {
+                        cmd,
+                        offset: 0,
+                        count: 0,
+                    },
                     sender,
                     func: |conn, cmd| {
                         Box::new(
-                            conn.req_packed_command(cmd)
+                            conn.req_packed_command(cmd.cmd)
                                 .map(|(conn, value)| (conn, vec![value])),
                         )
                     }, // FIXME Slow
@@ -581,14 +592,30 @@ impl ConnectionLike for Connection {
 
     fn req_packed_commands(
         self,
-        _cmd: Vec<u8>,
-        _offset: usize,
-        _count: usize,
+        cmd: Vec<u8>,
+        offset: usize,
+        count: usize,
     ) -> RedisFuture<(Self, Vec<Value>)> {
-        unimplemented!()
-        //Box::new(self.request(cmd, move |cmd, conn| {
-        //    conn.req_packed_commands(cmd, offset, count)
-        //}))
+        let (sender, receiver) = oneshot::channel();
+        Box::new(
+            self.0
+                .clone()
+                .send(Message {
+                    cmd: CmdArg { cmd, offset, count },
+                    sender,
+                    func: |conn, cmd| conn.req_packed_commands(cmd.cmd, cmd.offset, cmd.count),
+                })
+                .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                .and_then(move |_| {
+                    receiver.then(|result| {
+                        result
+                            .unwrap_or_else(|_| {
+                                Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                            })
+                            .map(|vec| (self, vec))
+                    })
+                }),
+        )
     }
 
     fn get_db(&self) -> i64 {
