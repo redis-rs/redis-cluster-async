@@ -9,7 +9,7 @@ use std::{
 };
 
 use {
-    proptest::{prelude::*, proptest},
+    proptest::proptest,
     tokio::{prelude::*, runtime::current_thread::Runtime},
 };
 
@@ -105,35 +105,36 @@ fn basic() {
 fn proptests() {
     let _ = env_logger::try_init();
 
-    let env = std::cell::RefCell::new(RedisEnv::new());
+    let mut env = std::cell::RefCell::new(RedisEnv::new());
 
-    proptest!(ProptestConfig { cases: 50, .. Default::default() }, |(requests in 0..15, value in 0..i32::max_value())| {
+    let connection = {
+        let env = env.get_mut();
+        env.runtime.block_on(env.client.get_connection()).unwrap()
+    };
+
+    proptest!(|(requests in 0..15, value in 0..i32::max_value())| {
         let mut env = env.borrow_mut();
         let env = &mut *env;
-
-        let client = &env.client;
 
         let completed = Cell::new(0);
         let completed = &completed;
         env.runtime
             .block_on(future::lazy(|| {
-                client.get_connection().and_then(|connection| {
-                    stream::futures_unordered((0..requests).map(|i| {
-                        let key = format!("test-{}-{}", value, i);
-                        cmd("SET")
-                            .arg(&key)
-                            .arg(i)
-                            .clone()
-                            .query_async(connection.clone())
-                            .and_then(move |(connection, ())| {
-                                cmd("GET").arg(key).clone().query_async(connection)
-                            })
-                            .map(move |(_, res): (_, i32)| {
-                                assert_eq!(res, i);
-                                completed.set(completed.get() + 1);
-                            })
-                    })).collect()
-                })
+                stream::futures_unordered((0..requests).map(|i| {
+                    let key = format!("test-{}-{}", value, i);
+                    cmd("SET")
+                        .arg(&key)
+                        .arg(i)
+                        .clone()
+                        .query_async(connection.clone())
+                        .and_then(move |(connection, ())| {
+                            cmd("GET").arg(key).clone().query_async(connection)
+                        })
+                        .map(move |(_, res): (_, i32)| {
+                            assert_eq!(res, i);
+                            completed.set(completed.get() + 1);
+                        })
+                })).collect()
             }))
             .unwrap();
         assert_eq!(completed.get(), requests);
