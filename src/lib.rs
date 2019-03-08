@@ -69,6 +69,7 @@
 extern crate crc16;
 #[macro_use]
 extern crate futures;
+#[macro_use]
 extern crate log;
 extern crate rand;
 
@@ -213,7 +214,7 @@ struct Request<F, I> {
     retries: u32,
     sender: Option<oneshot::Sender<RedisResult<I>>>,
     info: RequestInfo,
-    future: F,
+    future: Option<F>,
 }
 
 #[must_use]
@@ -228,13 +229,20 @@ where
     F: Future<Item = (String, RedisResult<I>)>,
 {
     fn poll_request(&mut self, connections_len: usize) -> Poll<Next, RedisError> {
-        match self.future.poll() {
+        match self
+            .future
+            .as_mut()
+            .expect("Request future must be Some")
+            .poll()
+        {
             Ok(Async::Ready((_, Ok(item)))) => {
+                error!("Ok");
                 self.send(Ok(item));
                 Ok(Async::Ready(Next::Done))
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Ok(Async::Ready((addr, Err(err)))) => {
+                error!("Err {}", err);
                 if err.kind() == ErrorKind::ExtensionError {
                     let error_code = err.extension_error_code().unwrap();
 
@@ -494,8 +502,9 @@ impl Sink for Pipeline {
         let request = Request {
             retries,
             sender: Some(msg.sender),
-            future: Box::new(self.try_request(&info))
-                as RedisFuture<(String, RedisResult<Vec<Value>>)>,
+            future: Some(
+                Box::new(self.try_request(&info)) as RedisFuture<(String, RedisResult<Vec<Value>>)>
+            ),
             info,
         };
         self.futures.push(request);
@@ -508,12 +517,14 @@ impl Sink for Pipeline {
             self.state = match mem::replace(&mut self.state, ConnectionState::PollComplete) {
                 ConnectionState::Recover(mut future) => match future.poll() {
                     Ok(Async::Ready((slots, connections))) => {
+                        error!("Recovered!");
                         self.slots = slots;
                         self.connections = connections;
                         ConnectionState::PollComplete
                     }
                     Ok(Async::NotReady) => {
                         self.state = ConnectionState::Recover(future);
+                        error!("Recover not ready");
                         return Ok(Async::NotReady);
                     }
                     Err(_err) => ConnectionState::Recover(Box::new(self.refresh_slots())),
@@ -523,6 +534,15 @@ impl Sink for Pipeline {
                     let mut i = 0;
 
                     while i < self.futures.len() {
+                        if self.futures[i].future.is_none() {
+                            let mut request = self.futures.swap_remove(i);
+                            request.future = Some(Box::new(self.try_request(&request.info)));
+                            self.futures.push(request);
+                            if self.futures.len() != 1 {
+                                let last = self.futures.len() - 1;
+                                self.futures.swap(i, last);
+                            }
+                        }
                         match self.futures[i].poll_request(self.connections.len()) {
                             Ok(Async::NotReady) => {
                                 i += 1;
@@ -535,15 +555,23 @@ impl Sink for Pipeline {
                                 Next::TryNewConnection => {
                                     let mut request = self.futures.swap_remove(i);
                                     request.retries -= 1;
-                                    request.future = Box::new(self.try_request(&request.info));
+                                    request.future =
+                                        Some(Box::new(self.try_request(&request.info)));
                                     self.futures.push(request);
                                 }
                             },
-                            Err(err) => error = Some(err),
+                            Err(err) => {
+                                error = Some(err);
+
+                                let mut request = self.futures.swap_remove(i);
+                                request.future = None;
+                                self.futures.push(request);
+                            }
                         }
                     }
 
-                    if let Some(_err) = error {
+                    if let Some(err) = error {
+                        error!("Recovering {}", err);
                         ConnectionState::Recover(Box::new(self.refresh_slots()))
                     } else if self.futures.is_empty() {
                         return Ok(Async::Ready(()));
@@ -577,12 +605,20 @@ impl ConnectionLike for Connection {
                         )
                     }, // FIXME Slow
                 })
-                .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                .map_err(|_| {
+                    RedisError::from(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "redis_cluster: Unable to send command",
+                    ))
+                })
                 .and_then(move |_| {
                     receiver.then(|result| {
                         result
                             .unwrap_or_else(|_| {
-                                Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                                Err(RedisError::from(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "redis_cluster: Unable to receive command",
+                                )))
                             })
                             .map(|mut vec| (self, vec.pop().unwrap()))
                     })
@@ -746,12 +782,18 @@ impl Slot {
 fn get_slots(
     connection: redis::r#async::SharedConnection,
 ) -> impl Future<Item = Vec<Slot>, Error = RedisError> {
+    error!("get_slots");
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
     let packed_command = cmd.get_packed_command();
     connection
         .req_packed_command(packed_command)
+        .map_err(|err| {
+            error!("get_slots error: {}", err);
+            err
+        })
         .and_then(|(_connection, value)| {
+            error!("get_slots -> {:#?}", value);
             // Parse response.
             let mut result = Vec::with_capacity(2);
 

@@ -14,7 +14,10 @@ use {
     tokio::{prelude::*, runtime::current_thread::Runtime},
 };
 
-use redis_cluster_rs::{redis::cmd, Client};
+use redis_cluster_rs::{
+    redis::{cmd, RedisError},
+    Client,
+};
 
 const REDIS_URL: &str = "redis://127.0.0.1:7000/";
 
@@ -42,22 +45,70 @@ pub struct RedisEnv {
     _redis_lock: RedisLock,
     pub runtime: Runtime,
     pub client: Client,
-    pub nodes: Vec<String>,
-    pub replicas: Vec<String>,
 }
 
 impl RedisEnv {
     pub fn new() -> Self {
+        let _ = env_logger::try_init();
+
         let mut runtime = Runtime::new().unwrap();
         let redis_lock = RedisProcess::lock();
 
         let redis_client = redis::Client::open(REDIS_URL)
             .unwrap_or_else(|_| panic!("Failed to connect to '{}'", REDIS_URL));
 
-        let node_infos = redis::cmd("CLUSTER")
+        let node_infos = loop {
+            let node_infos = runtime
+                .block_on(future::lazy(|| {
+                    redis_client
+                        .get_shared_async_connection()
+                        .and_then(|conn| Self::cluster_info(&conn))
+                }))
+                .expect("Unable to query nodes for information");
+            // Wait for the cluster to stabilize
+            if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
+                break node_infos;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+
+        let mut nodes = Vec::new();
+        // Clear databases:
+        for (url, master) in node_infos {
+            if master {
+                nodes.push(url.to_string());
+                let redis_client = redis::Client::open(&url[..])
+                    .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
+                let () = redis::Cmd::new()
+                    .arg("FLUSHALL")
+                    .query(&redis_client)
+                    .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
+            }
+        }
+
+        let client = runtime
+            .block_on(future::lazy(|| {
+                Client::open(nodes.iter().map(|s| &s[..]).collect())
+            }))
+            .unwrap();
+
+        RedisEnv {
+            runtime,
+            client,
+            _redis_lock: redis_lock,
+        }
+    }
+
+    fn cluster_info<T>(
+        redis_client: &T,
+    ) -> impl Future<Item = Vec<(String, bool)>, Error = RedisError>
+    where
+        T: Clone + redis::r#async::ConnectionLike + Send + 'static,
+    {
+        redis::cmd("CLUSTER")
             .arg("NODES")
-            .query(&redis_client)
-            .map(|s: String| {
+            .query_async(redis_client.clone())
+            .map(|(_, s): (_, String)| {
                 s.lines()
                     .map(|line| {
                         let mut iter = line.split(' ');
@@ -76,45 +127,23 @@ impl RedisEnv {
                     })
                     .collect::<Vec<_>>()
             })
-            .expect("Unable to query nodes for information");
+    }
 
-        let mut nodes = Vec::new();
-        let mut replicas = Vec::new();
-        // Clear databases:
-        for (url, master) in node_infos {
-            if master {
-                nodes.push(url.to_string());
-                let redis_client = redis::Client::open(&url[..])
-                    .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
-                let () = redis::Cmd::new()
-                    .arg("FLUSHALL")
-                    .query(&redis_client)
-                    .unwrap();
-            } else {
-                replicas.push(url.to_string());
-            }
-        }
-
-        let client = runtime
-            .block_on(future::lazy(|| {
-                Client::open(nodes.iter().map(|s| &s[..]).collect())
-            }))
-            .unwrap();
-
-        RedisEnv {
-            runtime,
-            client,
-            nodes,
-            replicas,
-            _redis_lock: redis_lock,
-        }
+    fn replicas(&self) -> impl Future<Item = Vec<String>, Error = RedisError> {
+        self.client
+            .get_connection()
+            .and_then(|conn| Self::cluster_info(&conn))
+            .map(|cluster_info| {
+                cluster_info
+                    .into_iter()
+                    .filter_map(|(url, master)| if master { None } else { Some(url) })
+                    .collect()
+            })
     }
 }
 
 #[test]
 fn basic() {
-    let _ = env_logger::try_init();
-
     let mut env = RedisEnv::new();
     let client = env.client;
     env.runtime
@@ -138,8 +167,6 @@ fn basic() {
 
 #[test]
 fn proptests() {
-    let _ = env_logger::try_init();
-
     let env = std::cell::RefCell::new(FailoverEnv::new());
 
     proptest!(|(requests in 0..15, value in 0..i32::max_value())| {
@@ -148,14 +175,13 @@ fn proptests() {
 }
 
 #[test]
-fn failover() {
+fn basic_failover() {
     test_failover(&mut FailoverEnv::new(), 10, 123);
 }
 
 struct FailoverEnv {
     env: RedisEnv,
     connection: redis_cluster_rs::Connection,
-    failover_node_redis: redis::r#async::SharedConnection,
 }
 
 impl FailoverEnv {
@@ -163,18 +189,7 @@ impl FailoverEnv {
         let mut env = RedisEnv::new();
         let connection = env.runtime.block_on(env.client.get_connection()).unwrap();
 
-        let failover_node_redis = {
-            let redis_client = redis::Client::open(&env.replicas[1][..])
-                .unwrap_or_else(|_| panic!("Failed to connect to '{}'", env.replicas[1]));
-            env.runtime
-                .block_on(redis_client.get_shared_async_connection())
-                .unwrap()
-        };
-        FailoverEnv {
-            env,
-            connection,
-            failover_node_redis,
-        }
+        FailoverEnv { env, connection }
     }
 }
 
@@ -192,11 +207,16 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
     let completed = Cell::new(0);
     let completed = &completed;
 
-    let FailoverEnv {
-        env: RedisEnv { runtime, .. },
-        connection,
-        failover_node_redis,
-    } = env;
+    let FailoverEnv { env, connection } = env;
+
+    let replicas = env.runtime.block_on(env.replicas()).unwrap();
+    let failover_node_redis = {
+        let redis_client = redis::Client::open(&replicas[0][..])
+            .unwrap_or_else(|_| panic!("Failed to connect to '{}'", replicas[0]));
+        env.runtime
+            .block_on(redis_client.get_shared_async_connection())
+            .unwrap()
+    };
 
     let test_future = future::lazy(|| {
         stream::futures_unordered((0..requests).map(|i| {
@@ -217,7 +237,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
         .collect()
         .from_err()
     });
-    runtime
+    env.runtime
         .block_on(
             test_future
                 .select(
