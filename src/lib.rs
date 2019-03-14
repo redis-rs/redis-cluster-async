@@ -79,6 +79,7 @@ use std::{
     io::{self, BufRead, Cursor},
     iter::Iterator,
     mem,
+    time::Duration,
 };
 
 use crc16::*;
@@ -87,7 +88,7 @@ use futures::{
     prelude::*,
     stream,
     sync::{mpsc, oneshot},
-    StartSend,
+    try_ready, StartSend,
 };
 use log::trace;
 use rand::seq::IteratorRandom;
@@ -208,17 +209,23 @@ struct RequestInfo {
     excludes: HashSet<String>,
 }
 
+enum RequestState<F> {
+    None,
+    Future(F),
+    Delay(tokio_timer::Delay),
+}
+
 struct Request<F, I> {
     retries: u32,
     sender: Option<oneshot::Sender<RedisResult<I>>>,
     info: RequestInfo,
-    future: Option<F>,
+    future: RequestState<F>,
 }
 
 #[must_use]
 enum Next {
     TryNewConnection,
-    Delay,
+    Delay(Duration),
     Done,
 }
 
@@ -227,12 +234,17 @@ where
     F: Future<Item = (String, RedisResult<I>)>,
 {
     fn poll_request(&mut self, connections_len: usize) -> Poll<Next, RedisError> {
-        match self
-            .future
-            .as_mut()
-            .expect("Request future must be Some")
-            .poll()
-        {
+        let future = match &mut self.future {
+            RequestState::Future(f) => f,
+            RequestState::Delay(delay) => {
+                return Ok(match delay.poll() {
+                    Ok(Async::Ready(_)) | Err(_) => Next::TryNewConnection.into(),
+                    Ok(Async::NotReady) => Async::NotReady,
+                });
+            }
+            _ => panic!("Request future must be Some"),
+        };
+        match future.poll() {
             Ok(Async::Ready((_, Ok(item)))) => {
                 trace!("Ok");
                 self.send(Ok(item));
@@ -240,7 +252,14 @@ where
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Ok(Async::Ready((addr, Err(err)))) => {
-                trace!("Err {}", err);
+                trace!("Request error {}", err);
+
+                self.retries -= 1;
+                if self.retries <= 0 {
+                    self.send(Err(err));
+                    return Ok(Async::Ready(Next::Done));
+                }
+
                 if err.kind() == ErrorKind::ExtensionError {
                     let error_code = err.extension_error_code().unwrap();
 
@@ -250,9 +269,10 @@ where
                         return Err(err);
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
-                        let _sleep_time_millis = 2u64.pow(16 - self.retries.max(9)) * 10;
+                        let sleep_duration =
+                            Duration::from_millis(2u64.pow(16 - self.retries.max(9)) * 10);
                         self.info.excludes.clear();
-                        return Ok(Async::Ready(Next::Delay)); // FIXME Register delay
+                        return Ok(Async::Ready(Next::Delay(sleep_duration))); // FIXME Register delay
                     }
                 }
 
@@ -494,7 +514,7 @@ impl Sink for Pipeline {
         let request = Request {
             retries,
             sender: Some(msg.sender),
-            future: None,
+            future: RequestState::None,
             info,
         };
         self.futures.push(request);
@@ -524,9 +544,10 @@ impl Sink for Pipeline {
                     let mut i = 0;
 
                     while i < self.futures.len() {
-                        if self.futures[i].future.is_none() {
+                        if let RequestState::None = self.futures[i].future {
                             let mut request = self.futures.swap_remove(i);
-                            request.future = Some(Box::new(self.try_request(&request.info)));
+                            request.future =
+                                RequestState::Future(Box::new(self.try_request(&request.info)));
                             self.futures.push(request);
                             if self.futures.len() != 1 {
                                 let last = self.futures.len() - 1;
@@ -538,15 +559,20 @@ impl Sink for Pipeline {
                                 i += 1;
                             }
                             Ok(Async::Ready(next)) => match next {
-                                Next::Delay => unimplemented!(),
+                                Next::Delay(duration) => {
+                                    let mut request = self.futures.swap_remove(i);
+                                    request.future =
+                                        RequestState::Delay(tokio_timer::sleep(duration));
+                                    self.futures.push(request);
+                                }
                                 Next::Done => {
                                     self.futures.swap_remove(i);
                                 }
                                 Next::TryNewConnection => {
                                     let mut request = self.futures.swap_remove(i);
-                                    request.retries -= 1;
-                                    request.future =
-                                        Some(Box::new(self.try_request(&request.info)));
+                                    request.future = RequestState::Future(Box::new(
+                                        self.try_request(&request.info),
+                                    ));
                                     self.futures.push(request);
                                 }
                             },
@@ -554,7 +580,7 @@ impl Sink for Pipeline {
                                 error = Some(err);
 
                                 let mut request = self.futures.swap_remove(i);
-                                request.future = None;
+                                request.future = RequestState::None;
                                 self.futures.push(request);
                             }
                         }
