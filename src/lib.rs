@@ -67,9 +67,7 @@
 //! }
 //! ```
 extern crate crc16;
-#[macro_use]
 extern crate futures;
-#[macro_use]
 extern crate log;
 extern crate rand;
 
@@ -236,13 +234,13 @@ where
             .poll()
         {
             Ok(Async::Ready((_, Ok(item)))) => {
-                error!("Ok");
+                trace!("Ok");
                 self.send(Ok(item));
                 Ok(Async::Ready(Next::Done))
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Ok(Async::Ready((addr, Err(err)))) => {
-                error!("Err {}", err);
+                trace!("Err {}", err);
                 if err.kind() == ErrorKind::ExtensionError {
                     let error_code = err.extension_error_code().unwrap();
 
@@ -509,14 +507,14 @@ impl Sink for Pipeline {
             self.state = match mem::replace(&mut self.state, ConnectionState::PollComplete) {
                 ConnectionState::Recover(mut future) => match future.poll() {
                     Ok(Async::Ready((slots, connections))) => {
-                        error!("Recovered with {} connections!", connections.len());
+                        trace!("Recovered with {} connections!", connections.len());
                         self.slots = slots;
                         self.connections = connections;
                         ConnectionState::PollComplete
                     }
                     Ok(Async::NotReady) => {
                         self.state = ConnectionState::Recover(future);
-                        error!("Recover not ready");
+                        trace!("Recover not ready");
                         return Ok(Async::NotReady);
                     }
                     Err(_err) => ConnectionState::Recover(Box::new(self.refresh_slots())),
@@ -563,7 +561,7 @@ impl Sink for Pipeline {
                     }
 
                     if let Some(err) = error {
-                        error!("Recovering {}", err);
+                        trace!("Recovering {}", err);
                         ConnectionState::Recover(Box::new(self.refresh_slots()))
                     } else if self.futures.is_empty() {
                         return Ok(Async::Ready(()));
@@ -776,18 +774,18 @@ impl Slot {
 fn get_slots(
     connection: redis::r#async::SharedConnection,
 ) -> impl Future<Item = Vec<Slot>, Error = RedisError> {
-    error!("get_slots");
+    trace!("get_slots");
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
     let packed_command = cmd.get_packed_command();
     connection
         .req_packed_command(packed_command)
         .map_err(|err| {
-            error!("get_slots error: {}", err);
+            trace!("get_slots error: {}", err);
             err
         })
         .and_then(|(_connection, value)| {
-            error!("get_slots -> {:#?}", value);
+            trace!("get_slots -> {:#?}", value);
             // Parse response.
             let mut result = Vec::with_capacity(2);
 
