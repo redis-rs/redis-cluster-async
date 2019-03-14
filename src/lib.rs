@@ -92,7 +92,7 @@ use futures::{
     StartSend,
 };
 use log::trace;
-use rand::seq::sample_iter;
+use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
     r#async::ConnectionLike, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
@@ -345,14 +345,8 @@ impl Pipeline {
         let slots_len = self.slots.len();
 
         let slots_future = {
-            let mut rng = thread_rng();
-            let samples = sample_iter(
-                &mut rng,
-                self.connections.values().cloned().collect::<Vec<_>>(),
-                self.connections.len(),
-            )
-            .ok()
-            .unwrap();
+            // TODO redis_cluster_rs used `sample_iter` here which didn't seem to actually do anything?
+            let samples = self.connections.values().cloned().collect::<Vec<_>>();
 
             stream::iter_ok(samples)
                 .and_then(|conn| get_slots(conn).then(|result| Ok(result.ok())))
@@ -502,9 +496,7 @@ impl Sink for Pipeline {
         let request = Request {
             retries,
             sender: Some(msg.sender),
-            future: Some(
-                Box::new(self.try_request(&info)) as RedisFuture<(String, RedisResult<Vec<Value>>)>
-            ),
+            future: None,
             info,
         };
         self.futures.push(request);
@@ -517,7 +509,7 @@ impl Sink for Pipeline {
             self.state = match mem::replace(&mut self.state, ConnectionState::PollComplete) {
                 ConnectionState::Recover(mut future) => match future.poll() {
                     Ok(Async::Ready((slots, connections))) => {
-                        error!("Recovered!");
+                        error!("Recovered with {} connections!", connections.len());
                         self.slots = slots;
                         self.connections = connections;
                         ConnectionState::PollComplete
@@ -718,17 +710,19 @@ fn get_random_connection<'a>(
     connections: &'a HashMap<String, redis::r#async::SharedConnection>,
     excludes: Option<&'a HashSet<String>>,
 ) -> (String, redis::r#async::SharedConnection) {
+    debug_assert!(!connections.is_empty());
+
     let mut rng = thread_rng();
-    let samples = match excludes {
+    let sample = match excludes {
         Some(excludes) if excludes.len() < connections.len() => {
             let target_keys = connections.keys().filter(|key| !excludes.contains(*key));
-            sample_iter(&mut rng, target_keys, 1).unwrap()
+            target_keys.choose(&mut rng)
         }
-        _ => sample_iter(&mut rng, connections.keys(), 1).unwrap(),
+        _ => connections.keys().choose(&mut rng),
     };
 
-    let addr = samples.first().unwrap();
-    (addr.to_string(), connections.get(*addr).unwrap().clone())
+    let addr = sample.expect("No targets to choose from");
+    (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 
 fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {

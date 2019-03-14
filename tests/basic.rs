@@ -7,6 +7,7 @@ use std::{
     cell::Cell,
     error::Error,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
 
 use {
@@ -130,15 +131,36 @@ impl RedisEnv {
     }
 
     fn replicas(&self) -> impl Future<Item = Vec<String>, Error = RedisError> {
+        fn replicas_(
+            conn: redis_cluster_rs::Connection,
+            attempt: i32,
+        ) -> impl Future<Item = Vec<String>, Error = RedisError> {
+            if attempt > 10 {
+                panic!("To many replica queries. The nodes does not seem to re-synchronize.",);
+            }
+            RedisEnv::cluster_info(&conn)
+                .map(|cluster_info| {
+                    cluster_info
+                        .into_iter()
+                        .filter_map(|(url, master)| if master { None } else { Some(url) })
+                        .collect()
+                })
+                .and_then(move |replicas: Vec<_>| {
+                    if !replicas.is_empty() {
+                        Box::new(future::ok(replicas)) as Box<Future<Item = _, Error = _>>
+                    } else {
+                        Box::new(
+                            tokio_timer::sleep(Duration::from_millis(500))
+                                .map_err(|err| panic!("{}", err))
+                                .and_then(move |_| replicas_(conn, attempt + 1)),
+                        ) as Box<Future<Item = _, Error = _>>
+                    }
+                })
+        }
+
         self.client
             .get_connection()
-            .and_then(|conn| Self::cluster_info(&conn))
-            .map(|cluster_info| {
-                cluster_info
-                    .into_iter()
-                    .filter_map(|(url, master)| if master { None } else { Some(url) })
-                    .collect()
-            })
+            .and_then(|conn| replicas_(conn, 1))
     }
 }
 
@@ -169,9 +191,12 @@ fn basic() {
 fn proptests() {
     let env = std::cell::RefCell::new(FailoverEnv::new());
 
-    proptest!(|(requests in 0..15, value in 0..i32::max_value())| {
-        test_failover(&mut env.borrow_mut(), requests, value)
-    });
+    proptest!(
+        proptest::prelude::ProptestConfig { cases: 50, .. Default::default() },
+        |(requests in 0..15, value in 0..i32::max_value())| {
+            test_failover(&mut env.borrow_mut(), requests, value)
+        }
+    );
 }
 
 #[test]
@@ -238,14 +263,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
         .from_err()
     });
     env.runtime
-        .block_on(
-            test_future
-                .select(
-                    future::lazy(|| do_failover(failover_node_redis.clone()))
-                        .and_then(|_| future::empty()),
-                )
-                .map_err(|(err, _)| err),
-        )
-        .unwrap();
-    assert_eq!(completed.get(), requests);
+        .block_on(test_future.join(future::lazy(|| do_failover(failover_node_redis.clone()))))
+        .unwrap_or_else(|err| panic!("{}", err));
+    assert_eq!(completed.get(), requests, "Some requests never completed!");
 }
