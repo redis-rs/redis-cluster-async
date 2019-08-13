@@ -78,11 +78,11 @@ impl RedisEnv {
         for (url, master) in node_infos {
             if master {
                 nodes.push(url.to_string());
-                let redis_client = redis::Client::open(&url[..])
+                let mut redis_client = redis::Client::open(&url[..])
                     .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
                 let () = redis::Cmd::new()
                     .arg("FLUSHALL")
-                    .query(&redis_client)
+                    .query(&mut redis_client)
                     .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
             }
         }
@@ -104,7 +104,7 @@ impl RedisEnv {
         redis_client: &T,
     ) -> impl Future<Item = Vec<(String, bool)>, Error = RedisError>
     where
-        T: Clone + redis::r#async::ConnectionLike + Send + 'static,
+        T: Clone + redis::aio::ConnectionLike + Send + 'static,
     {
         redis::cmd("CLUSTER")
             .arg("NODES")
@@ -219,7 +219,7 @@ impl FailoverEnv {
 }
 
 fn do_failover(
-    redis: redis::r#async::SharedConnection,
+    redis: redis::aio::SharedConnection,
 ) -> impl Future<Item = (), Error = Box<Error + Send + Sync + 'static>> {
     cmd("CLUSTER")
         .arg("FAILOVER")

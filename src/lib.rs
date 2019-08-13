@@ -94,7 +94,7 @@ use log::trace;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
-    r#async::ConnectionLike, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
+    aio::ConnectionLike, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
     RedisError, RedisFuture, RedisResult, Value,
 };
 
@@ -154,7 +154,7 @@ impl Connection {
 }
 
 struct Pipeline {
-    connections: HashMap<String, redis::r#async::SharedConnection>,
+    connections: HashMap<String, redis::aio::SharedConnection>,
     slots: HashMap<u16, String>,
     state: ConnectionState,
     futures: Vec<Request<RedisFuture<(String, RedisResult<Vec<Value>>)>, Vec<Value>>>,
@@ -171,9 +171,9 @@ struct Message {
     cmd: CmdArg,
     sender: oneshot::Sender<RedisResult<Vec<Value>>>,
     func: fn(
-        redis::r#async::SharedConnection,
+        redis::aio::SharedConnection,
         CmdArg,
-    ) -> RedisFuture<(redis::r#async::SharedConnection, Vec<Value>)>,
+    ) -> RedisFuture<(redis::aio::SharedConnection, Vec<Value>)>,
 }
 
 enum ConnectionState {
@@ -181,7 +181,7 @@ enum ConnectionState {
     Recover(
         RedisFuture<(
             HashMap<u16, String>,
-            HashMap<String, redis::r#async::SharedConnection>,
+            HashMap<String, redis::aio::SharedConnection>,
         )>,
     ),
 }
@@ -203,9 +203,9 @@ struct RequestInfo {
     cmd: CmdArg,
     slot: Option<u16>,
     func: fn(
-        redis::r#async::SharedConnection,
+        redis::aio::SharedConnection,
         CmdArg,
-    ) -> RedisFuture<(redis::r#async::SharedConnection, Vec<Value>)>,
+    ) -> RedisFuture<(redis::aio::SharedConnection, Vec<Value>)>,
     excludes: HashSet<String>,
 }
 
@@ -321,7 +321,7 @@ impl Pipeline {
 
     fn create_initial_connections(
         initial_nodes: &Vec<ConnectionInfo>,
-    ) -> impl ImplRedisFuture<HashMap<String, redis::r#async::SharedConnection>> {
+    ) -> impl ImplRedisFuture<HashMap<String, redis::aio::SharedConnection>> {
         let connections = HashMap::with_capacity(initial_nodes.len());
 
         stream::iter_ok(initial_nodes.clone())
@@ -358,7 +358,7 @@ impl Pipeline {
         &mut self,
     ) -> impl ImplRedisFuture<(
         HashMap<u16, String>,
-        HashMap<String, redis::r#async::SharedConnection>,
+        HashMap<String, redis::aio::SharedConnection>,
     )> {
         let slots_len = self.slots.len();
 
@@ -446,7 +446,7 @@ impl Pipeline {
     fn get_connection(
         &mut self,
         slot: u16,
-    ) -> impl ImplRedisFuture<(String, redis::r#async::SharedConnection)> + 'static {
+    ) -> impl ImplRedisFuture<(String, redis::aio::SharedConnection)> + 'static {
         if let Some(addr) = self.slots.get(&slot) {
             if self.connections.contains_key(addr) {
                 return future::Either::A(future::ok((
@@ -706,7 +706,7 @@ where
 pub trait ImplRedisFuture<T>: Future<Item = T, Error = RedisError> {}
 impl<T, F> ImplRedisFuture<T> for F where F: Future<Item = T, Error = RedisError> {}
 
-fn connect<T>(info: T) -> RedisFuture<redis::r#async::SharedConnection>
+fn connect<T>(info: T) -> RedisFuture<redis::aio::SharedConnection>
 where
     T: IntoConnectionInfo,
 {
@@ -715,7 +715,7 @@ where
     Box::new(client.get_shared_async_connection())
 }
 
-fn connect_and_check<T>(info: T) -> RedisFuture<redis::r#async::SharedConnection>
+fn connect_and_check<T>(info: T) -> RedisFuture<redis::aio::SharedConnection>
 where
     T: IntoConnectionInfo,
 {
@@ -723,17 +723,17 @@ where
 }
 
 fn check_connection(
-    conn: redis::r#async::SharedConnection,
-) -> impl ImplRedisFuture<redis::r#async::SharedConnection> {
+    conn: redis::aio::SharedConnection,
+) -> impl ImplRedisFuture<redis::aio::SharedConnection> {
     let mut cmd = Cmd::new();
     cmd.arg("PING");
     cmd.query_async::<_, String>(conn).map(|(conn, _)| conn)
 }
 
 fn get_random_connection<'a>(
-    connections: &'a HashMap<String, redis::r#async::SharedConnection>,
+    connections: &'a HashMap<String, redis::aio::SharedConnection>,
     excludes: Option<&'a HashSet<String>>,
-) -> (String, redis::r#async::SharedConnection) {
+) -> (String, redis::aio::SharedConnection) {
     debug_assert!(!connections.is_empty());
 
     let mut rng = thread_rng();
@@ -798,7 +798,7 @@ impl Slot {
 
 // Get slot data from connection.
 fn get_slots(
-    connection: redis::r#async::SharedConnection,
+    connection: redis::aio::SharedConnection,
 ) -> impl Future<Item = Vec<Slot>, Error = RedisError> {
     trace!("get_slots");
     let mut cmd = Cmd::new();
@@ -871,7 +871,7 @@ fn get_slots(
                         end,
                         master: nodes.pop().unwrap(),
                         replicas,
-                    });;
+                    });
                 }
             }
 
