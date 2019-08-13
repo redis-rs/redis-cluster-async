@@ -66,12 +66,12 @@
 //!     })).unwrap();
 //! }
 //! ```
-extern crate crc16;
-extern crate futures;
-extern crate log;
-extern crate rand;
 
-pub extern crate redis;
+
+
+
+
+pub use redis;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -187,7 +187,7 @@ enum ConnectionState {
 }
 
 impl fmt::Debug for ConnectionState {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",

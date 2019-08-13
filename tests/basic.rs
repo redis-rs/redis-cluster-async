@@ -1,8 +1,3 @@
-extern crate lazy_static;
-extern crate proptest;
-extern crate redis_cluster_rs;
-extern crate tokio;
-
 use std::{
     cell::Cell,
     error::Error,
@@ -147,13 +142,13 @@ impl RedisEnv {
                 })
                 .and_then(move |replicas: Vec<_>| {
                     if !replicas.is_empty() {
-                        Box::new(future::ok(replicas)) as Box<Future<Item = _, Error = _>>
+                        Box::new(future::ok(replicas)) as Box<dyn Future<Item = _, Error = _>>
                     } else {
                         Box::new(
                             tokio_timer::sleep(Duration::from_millis(500))
                                 .map_err(|err| panic!("{}", err))
                                 .and_then(move |_| replicas_(conn, attempt + 1)),
-                        ) as Box<Future<Item = _, Error = _>>
+                        ) as Box<dyn Future<Item = _, Error = _>>
                     }
                 })
         }
@@ -220,7 +215,7 @@ impl FailoverEnv {
 
 fn do_failover(
     redis: redis::aio::SharedConnection,
-) -> impl Future<Item = (), Error = Box<Error + Send + Sync + 'static>> {
+) -> impl Future<Item = (), Error = Box<dyn Error + Send + Sync + 'static>> {
     cmd("CLUSTER")
         .arg("FAILOVER")
         .query_async(redis)
