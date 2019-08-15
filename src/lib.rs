@@ -67,16 +67,11 @@
 //! }
 //! ```
 
-
-
-
-
 pub use redis;
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
-    io::{self, BufRead, Cursor},
+    fmt, io,
     iter::Iterator,
     mem,
     time::Duration,
@@ -372,6 +367,7 @@ impl Pipeline {
                 .into_future()
                 .map_err(|(err, _)| err)
                 .and_then(move |(opt, _)| {
+                    // FIXME Don't store 16k entries
                     let mut new_slots = HashMap::with_capacity(slots_len);
                     if let Some(slots_data) = opt {
                         for slot_data in slots_data {
@@ -750,26 +746,31 @@ fn get_random_connection<'a>(
 }
 
 fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
-    let args = unpack_command(cmd);
-    if args.len() > 1 {
-        Some(State::<XMODEM>::calculate(&args[1]) % SLOT_SIZE as u16)
-    } else {
-        None
-    }
+    // FIXME This does not take newlines in the key string into account
+    unpack_command(cmd)
+        .nth(1)
+        .map(|key| State::<XMODEM>::calculate(key) % SLOT_SIZE as u16)
 }
 
-fn unpack_command(cmd: &[u8]) -> Vec<Vec<u8>> {
-    let mut args: Vec<Vec<u8>> = Vec::new();
-
-    let cursor = Cursor::new(cmd);
-    for line in cursor.lines() {
-        if let Ok(line) = line {
-            if !line.starts_with("*") && !line.starts_with("$") {
-                args.push(line.into_bytes());
+fn byte_lines(xs: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut current = Some(xs);
+    std::iter::from_fn(move || match current.take() {
+        Some(xs) => {
+            for i in 0..xs.len() {
+                if xs[i..].starts_with(b"\r\n") {
+                    let line = &xs[..i];
+                    current = Some(&xs[i + 2..]);
+                    return Some(line);
+                }
             }
+            Some(xs)
         }
-    }
-    args
+        None => None,
+    })
+}
+
+fn unpack_command(cmd: &[u8]) -> impl Iterator<Item = &[u8]> {
+    byte_lines(cmd).filter(|line| !line.starts_with(b"*") && !line.starts_with(b"$"))
 }
 
 #[derive(Debug)]
@@ -877,4 +878,20 @@ fn get_slots(
 
             Ok(result)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot() {
+        assert_eq!(
+            slot_for_packed_command(&[
+                42, 50, 13, 10, 36, 54, 13, 10, 69, 88, 73, 83, 84, 83, 13, 10, 36, 49, 54, 13, 10,
+                244, 93, 23, 40, 126, 127, 253, 33, 89, 47, 185, 204, 171, 249, 96, 139, 13, 10
+            ]),
+            Some(964)
+        );
+    }
 }
