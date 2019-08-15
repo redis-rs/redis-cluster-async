@@ -746,31 +746,47 @@ fn get_random_connection<'a>(
 }
 
 fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
-    // FIXME This does not take newlines in the key string into account
-    unpack_command(cmd)
-        .nth(1)
-        .map(|key| State::<XMODEM>::calculate(key) % SLOT_SIZE as u16)
-}
-
-fn byte_lines(xs: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut current = Some(xs);
-    std::iter::from_fn(move || match current.take() {
-        Some(xs) => {
-            for i in 0..xs.len() {
-                if xs[i..].starts_with(b"\r\n") {
-                    let line = &xs[..i];
-                    current = Some(&xs[i + 2..]);
-                    return Some(line);
-                }
-            }
-            Some(xs)
-        }
-        None => None,
+    command_key(cmd).map(|key| {
+        let key = sub_key(&key);
+        State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
     })
 }
 
-fn unpack_command(cmd: &[u8]) -> impl Iterator<Item = &[u8]> {
-    byte_lines(cmd).filter(|line| !line.starts_with(b"*") && !line.starts_with(b"$"))
+fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
+    // TODO Avoid parsing the entire request to a `redis::Value`
+    redis::parse_redis_value(cmd)
+        .ok()
+        .and_then(|value| match value {
+            Value::Bulk(mut args) => {
+                if args.len() >= 2 {
+                    match args.swap_remove(1) {
+                        Value::Data(key) => Some(key),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+}
+
+fn sub_key(key: &[u8]) -> &[u8] {
+    key.iter()
+        .position(|b| *b == b'{')
+        .and_then(|open| {
+            key[open + 1..]
+                .iter()
+                .position(|b| *b == b'}')
+                .and_then(|close| {
+                    if close != 0 {
+                        Some(&key[open + 1..open + close + 1])
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or(key)
 }
 
 #[derive(Debug)]
@@ -892,6 +908,25 @@ mod tests {
                 244, 93, 23, 40, 126, 127, 253, 33, 89, 47, 185, 204, 171, 249, 96, 139, 13, 10
             ]),
             Some(964)
+        );
+        assert_eq!(
+            slot_for_packed_command(&[
+                42, 54, 13, 10, 36, 51, 13, 10, 83, 69, 84, 13, 10, 36, 49, 54, 13, 10, 36, 241,
+                197, 111, 180, 254, 5, 175, 143, 146, 171, 39, 172, 23, 164, 145, 13, 10, 36, 52,
+                13, 10, 116, 114, 117, 101, 13, 10, 36, 50, 13, 10, 78, 88, 13, 10, 36, 50, 13, 10,
+                80, 88, 13, 10, 36, 55, 13, 10, 49, 56, 48, 48, 48, 48, 48, 13, 10
+            ]),
+            Some(8352)
+        );
+
+        assert_eq!(
+            slot_for_packed_command(&[
+                42, 54, 13, 10, 36, 51, 13, 10, 83, 69, 84, 13, 10, 36, 49, 54, 13, 10, 169, 233,
+                247, 59, 50, 247, 100, 232, 123, 140, 2, 101, 125, 221, 66, 170, 13, 10, 36, 52,
+                13, 10, 116, 114, 117, 101, 13, 10, 36, 50, 13, 10, 78, 88, 13, 10, 36, 50, 13, 10,
+                80, 88, 13, 10, 36, 55, 13, 10, 49, 56, 48, 48, 48, 48, 48, 13, 10
+            ]),
+            Some(5210),
         );
     }
 }
