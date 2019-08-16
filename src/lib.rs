@@ -70,7 +70,7 @@
 pub use redis;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, io,
     iter::Iterator,
     mem,
@@ -159,9 +159,11 @@ where
     }
 }
 
+type SlotMap = BTreeMap<u16, String>;
+
 struct Pipeline<C> {
     connections: HashMap<String, C>,
-    slots: HashMap<u16, String>,
+    slots: SlotMap,
     state: ConnectionState<C>,
     futures: Vec<Request<RedisFuture<(String, RedisResult<Vec<Value>>)>, Vec<Value>, C>>,
 }
@@ -181,7 +183,7 @@ struct Message<C> {
 
 enum ConnectionState<C> {
     PollComplete,
-    Recover(RedisFuture<(HashMap<u16, String>, HashMap<String, C>)>),
+    Recover(RedisFuture<(SlotMap, HashMap<String, C>)>),
 }
 
 impl<C> fmt::Debug for ConnectionState<C> {
@@ -248,7 +250,7 @@ where
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Ok(Async::Ready((addr, Err(err)))) => {
-                trace!("Request error {}", err);
+                trace!("Request error {} {:?}", err, self.info.cmd.cmd);
 
                 self.retries -= 1;
                 if self.retries <= 0 {
@@ -303,7 +305,7 @@ where
         Self::create_initial_connections(&initial_nodes).and_then(|connections| {
             let mut connection = Some(Pipeline {
                 connections,
-                slots: HashMap::with_capacity(SLOT_SIZE),
+                slots: Default::default(),
                 futures: Vec::new(),
                 state: ConnectionState::PollComplete,
             });
@@ -353,11 +355,7 @@ where
     }
 
     // Query a node to discover slot-> master mappings.
-    fn refresh_slots(
-        &mut self,
-    ) -> impl ImplRedisFuture<(HashMap<u16, String>, HashMap<String, C>)> {
-        let slots_len = self.slots.len();
-
+    fn refresh_slots(&mut self) -> impl ImplRedisFuture<(SlotMap, HashMap<String, C>)> {
         let slots_future = {
             // TODO redis_cluster_rs used `sample_iter` here which didn't seem to actually do anything?
             let samples = self.connections.values().cloned().collect::<Vec<_>>();
@@ -367,24 +365,7 @@ where
                 .filter_map(|opt| opt)
                 .into_future()
                 .map_err(|(err, _)| err)
-                .and_then(move |(opt, _)| {
-                    // FIXME Don't store 16k entries
-                    let mut new_slots = HashMap::with_capacity(slots_len);
-                    if let Some(slots_data) = opt {
-                        for slot_data in slots_data {
-                            for slot in slot_data.start()..slot_data.end() + 1 {
-                                new_slots.insert(slot, slot_data.master().to_string());
-                            }
-                        }
-                    }
-                    if new_slots.len() != SLOT_SIZE {
-                        return Err(RedisError::from((
-                            ErrorKind::ResponseError,
-                            "Slot refresh error.",
-                        )));
-                    }
-                    Ok(new_slots)
-                })
+                .and_then(move |(opt, _)| Self::build_slot_map(opt))
         };
 
         let mut connections = mem::replace(&mut self.connections, Default::default());
@@ -440,8 +421,42 @@ where
         })
     }
 
+    fn build_slot_map(slots_data: Option<Vec<Slot>>) -> RedisResult<SlotMap> {
+        let mut new_slots = SlotMap::default();
+        if let Some(mut slots_data) = slots_data {
+            slots_data.sort_by_key(|slot_data| slot_data.start);
+            let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
+                if prev_end != slot_data.start() {
+                    return Err(RedisError::from((
+                        ErrorKind::ResponseError,
+                        "Slot refresh error.",
+                        format!(
+                            "Received overlapping slots {} and {}..{}",
+                            prev_end, slot_data.start, slot_data.end
+                        ),
+                    )));
+                }
+                Ok(slot_data.end() + 1)
+            })?;
+
+            if usize::from(last_slot) != SLOT_SIZE {
+                return Err(RedisError::from((
+                    ErrorKind::ResponseError,
+                    "Slot refresh error.",
+                    format!("Lacks the slots >= {}", last_slot),
+                )));
+            }
+
+            new_slots = slots_data
+                .iter()
+                .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
+                .collect();
+        }
+        Ok(new_slots)
+    }
+
     fn get_connection(&mut self, slot: u16) -> impl ImplRedisFuture<(String, C)> + 'static {
-        if let Some(addr) = self.slots.get(&slot) {
+        if let Some((_, addr)) = self.slots.range(&slot..).next() {
             if self.connections.contains_key(addr) {
                 return future::Either::A(future::ok((
                     addr.clone(),
