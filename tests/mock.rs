@@ -38,8 +38,8 @@ impl ConnectionLike for MockConnection {
             Box::new(future::ok((
                 self,
                 Value::Bulk(vec![Value::Bulk(vec![
-                    Value::Int(1),
-                    Value::Int(16384),
+                    Value::Int(0),
+                    Value::Int(16383),
                     Value::Bulk(vec![Value::Data(b"127.0.0.1".to_vec()), Value::Int(6379)]),
                 ])]),
             )))
