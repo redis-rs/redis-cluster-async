@@ -132,6 +132,14 @@ impl Client {
     pub fn get_connection(&self) -> impl ImplRedisFuture<Connection> {
         Connection::new(self.initial_nodes.clone())
     }
+
+    #[doc(hidden)]
+    pub fn get_generic_connection<C>(&self) -> impl ImplRedisFuture<Connection<C>>
+    where
+        C: ConnectionLike + Connect + Clone + Send + 'static,
+    {
+        Connection::new(self.initial_nodes.clone())
+    }
 }
 
 /// This is a connection of Redis cluster.
@@ -337,7 +345,7 @@ where
                 if connections.len() == 0 {
                     return Err(RedisError::from((
                         ErrorKind::IoError,
-                        "It is failed to check startup nodes.",
+                        "Failed to create initial connections",
                     )));
                 }
                 Ok(connections)
@@ -568,9 +576,8 @@ where
                             Err(err) => {
                                 error = Some(err);
 
-                                let mut request = self.futures.swap_remove(i);
-                                request.future = RequestState::None;
-                                self.futures.push(request);
+                                self.futures[i].future = RequestState::None;
+                                i += 1;
                             }
                         }
                     }

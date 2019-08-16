@@ -11,8 +11,8 @@ use {
 };
 
 use redis_cluster_rs::{
-    redis::{aio::ConnectionLike, cmd, IntoConnectionInfo, RedisError, RedisFuture, Value},
-    Client, Connect,
+    redis::{cmd, RedisError},
+    Client,
 };
 
 const REDIS_URL: &str = "redis://127.0.0.1:7000/";
@@ -156,37 +156,6 @@ impl RedisEnv {
         self.client
             .get_connection()
             .and_then(|conn| replicas_(conn, 1))
-    }
-}
-
-#[derive(Clone)]
-struct MockConnection;
-
-impl Connect for MockConnection {
-    fn connect<T>(_: T) -> RedisFuture<Self>
-    where
-        T: IntoConnectionInfo,
-    {
-        Box::new(future::ok(MockConnection))
-    }
-}
-
-impl ConnectionLike for MockConnection {
-    fn req_packed_command(self, _cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
-        Box::new(future::ok((self, Value::Nil)))
-    }
-
-    fn req_packed_commands(
-        self,
-        _cmd: Vec<u8>,
-        _offset: usize,
-        _count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
-        Box::new(future::ok((self, vec![])))
-    }
-
-    fn get_db(&self) -> i64 {
-        0
     }
 }
 
