@@ -386,12 +386,19 @@ where
         let slots_future = {
             let samples = self.connections.values().cloned().collect::<Vec<_>>();
 
+            let mut found_slots = false;
             stream::iter_ok(samples)
-                .and_then(|conn| get_slots(conn).then(|result| Ok(result.ok())))
-                .filter_map(|opt| opt)
-                .into_future()
-                .map_err(|(err, _)| err)
-                .and_then(move |(opt, _)| Self::build_slot_map(opt))
+                .and_then(|conn| get_slots(conn).and_then(Self::build_slot_map).then(Ok))
+                // Query connections until we find one that
+                .take_while(move |result: &RedisResult<_>| {
+                    let take_this = !found_slots;
+                    found_slots = result.is_ok();
+                    future::ok(take_this)
+                })
+                // Get the last result which is either Ok or all nodes failed to return slots
+                // to us
+                .fold(None, |_, result| Ok::<_, RedisError>(Some(result)))
+                .and_then(move |opt| opt.expect("No connections to refresh slots from"))
         };
 
         let mut connections = mem::replace(&mut self.connections, Default::default());
@@ -447,38 +454,34 @@ where
         })
     }
 
-    fn build_slot_map(slots_data: Option<Vec<Slot>>) -> RedisResult<SlotMap> {
-        let mut new_slots = SlotMap::default();
-        if let Some(mut slots_data) = slots_data {
-            slots_data.sort_by_key(|slot_data| slot_data.start);
-            let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
-                if prev_end != slot_data.start() {
-                    return Err(RedisError::from((
-                        ErrorKind::ResponseError,
-                        "Slot refresh error.",
-                        format!(
-                            "Received overlapping slots {} and {}..{}",
-                            prev_end, slot_data.start, slot_data.end
-                        ),
-                    )));
-                }
-                Ok(slot_data.end() + 1)
-            })?;
-
-            if usize::from(last_slot) != SLOT_SIZE {
+    fn build_slot_map(mut slots_data: Vec<Slot>) -> RedisResult<SlotMap> {
+        slots_data.sort_by_key(|slot_data| slot_data.start);
+        let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
+            if prev_end != slot_data.start() {
                 return Err(RedisError::from((
                     ErrorKind::ResponseError,
                     "Slot refresh error.",
-                    format!("Lacks the slots >= {}", last_slot),
+                    format!(
+                        "Received overlapping slots {} and {}..{}",
+                        prev_end, slot_data.start, slot_data.end
+                    ),
                 )));
             }
+            Ok(slot_data.end() + 1)
+        })?;
 
-            new_slots = slots_data
-                .iter()
-                .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
-                .collect();
+        if usize::from(last_slot) != SLOT_SIZE {
+            return Err(RedisError::from((
+                ErrorKind::ResponseError,
+                "Slot refresh error.",
+                format!("Lacks the slots >= {}", last_slot),
+            )));
         }
-        Ok(new_slots)
+
+        Ok(slots_data
+            .iter()
+            .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
+            .collect())
     }
 
     fn get_connection(
