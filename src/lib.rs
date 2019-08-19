@@ -178,7 +178,13 @@ struct Pipeline<C> {
     connections: HashMap<String, C>,
     slots: SlotMap,
     state: ConnectionState<C>,
-    futures: Vec<Request<RedisFuture<(String, RedisResult<Vec<Value>>)>, Vec<Value>, C>>,
+    futures: Vec<
+        Request<
+            Box<dyn Future<Item = (String, RedisResult<Vec<Value>>), Error = Void> + Send>,
+            Vec<Value>,
+            C,
+        >,
+    >,
     retries: Option<u32>,
 }
 
@@ -240,9 +246,11 @@ enum Next {
     Done,
 }
 
+enum Void {}
+
 impl<F, I, C> Request<F, I, C>
 where
-    F: Future<Item = (String, RedisResult<I>)>,
+    F: Future<Item = (String, RedisResult<I>), Error = Void>,
     C: ConnectionLike,
 {
     fn poll_request(&mut self, connections_len: usize) -> Poll<Next, RedisError> {
@@ -301,7 +309,7 @@ where
 
                 Ok(Async::Ready(Next::TryNewConnection))
             }
-            Err(_) => unreachable!(), // TODO USe Void
+            Err(void) => match void {},
         }
     }
 
@@ -474,7 +482,10 @@ where
         Ok(new_slots)
     }
 
-    fn get_connection(&mut self, slot: u16) -> impl ImplRedisFuture<(String, C)> + 'static {
+    fn get_connection(
+        &mut self,
+        slot: u16,
+    ) -> impl Future<Item = (String, C), Error = Void> + 'static {
         if let Some((_, addr)) = self.slots.range(&slot..).next() {
             if self.connections.contains_key(addr) {
                 return future::Either::A(future::ok((
@@ -483,7 +494,6 @@ where
                 )));
             }
 
-            // connections.entry(addr.to_string()).or_insert(conn),
             // Create new connection.
             //
             let random_conn = get_random_connection(&self.connections, None); // TODO Only do this lookup if the first check fails
@@ -502,7 +512,7 @@ where
     fn try_request(
         &mut self,
         info: &RequestInfo<C>,
-    ) -> impl ImplRedisFuture<(String, RedisResult<Vec<Value>>)> {
+    ) -> impl Future<Item = (String, RedisResult<Vec<Value>>), Error = Void> {
         let cmd = info.cmd.clone();
         let func = info.func;
         (if info.excludes.len() > 0 || info.slot.is_none() {
