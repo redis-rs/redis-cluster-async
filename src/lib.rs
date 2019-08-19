@@ -477,11 +477,12 @@ where
                 format!("Lacks the slots >= {}", last_slot),
             )));
         }
-
-        Ok(slots_data
+        let slot_map = slots_data
             .iter()
             .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
-            .collect())
+            .collect();
+        trace!("{:?}", slot_map);
+        Ok(slot_map)
     }
 
     fn get_connection(

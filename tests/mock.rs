@@ -15,7 +15,7 @@ use {
     tokio::runtime::current_thread::Runtime,
 };
 
-type Handler = Arc<dyn Fn(&[u8]) -> Result<(), RedisResult<Value>> + Send + Sync>;
+type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
 
 lazy_static::lazy_static! {
     static ref HANDLERS: RwLock<HashMap<String, Handler>>
@@ -23,7 +23,10 @@ lazy_static::lazy_static! {
 }
 
 #[derive(Clone)]
-pub struct MockConnection(Handler);
+pub struct MockConnection {
+    handler: Handler,
+    port: u16,
+}
 
 impl Connect for MockConnection {
     fn connect<T>(info: T) -> RedisFuture<Self>
@@ -32,18 +35,19 @@ impl Connect for MockConnection {
     {
         let info = info.into_connection_info().unwrap();
 
-        let name = match &*info.addr {
-            redis::ConnectionAddr::Tcp(addr, ..) => addr,
+        let (name, port) = match &*info.addr {
+            redis::ConnectionAddr::Tcp(addr, port) => (addr, *port),
             _ => unreachable!(),
         };
-        Box::new(future::ok(MockConnection(
-            HANDLERS
+        Box::new(future::ok(MockConnection {
+            handler: HANDLERS
                 .read()
                 .unwrap()
                 .get(name)
                 .unwrap_or_else(|| panic!("Handler `{}` were not installed", name))
                 .clone(),
-        )))
+            port,
+        }))
     }
 }
 
@@ -76,7 +80,7 @@ fn respond_startup(name: &str, cmd: &[u8]) -> Result<(), RedisResult<Value>> {
 impl ConnectionLike for MockConnection {
     fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
         Box::new(future::result(
-            (self.0)(&cmd)
+            (self.handler)(&cmd, self.port)
                 .expect_err("Handler did not specify a response")
                 .map(|value| (self, value)),
         ))
@@ -115,7 +119,7 @@ impl Drop for RemoveHandler {
 impl MockEnv {
     fn new(
         id: &str,
-        handler: impl Fn(&[u8]) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
+        handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
     ) -> Self {
         let mut runtime = Runtime::new().unwrap();
 
@@ -137,7 +141,7 @@ impl MockEnv {
 }
 
 #[test]
-fn tryagain() {
+fn tryagain_simple() {
     let _ = env_logger::try_init();
     let name = "tryagain";
 
@@ -147,7 +151,7 @@ fn tryagain() {
         connection,
         handler: _handler,
         ..
-    } = MockEnv::new(name, move |cmd: &[u8]| {
+    } = MockEnv::new(name, move |cmd: &[u8], _| {
         respond_startup(name, cmd)?;
 
         match requests.fetch_add(1, atomic::Ordering::SeqCst) {
@@ -181,7 +185,7 @@ fn tryagain_exhaust_retries() {
         ..
     } = MockEnv::new(name, {
         let requests = requests.clone();
-        move |cmd: &[u8]| {
+        move |cmd: &[u8], _| {
             respond_startup(name, cmd)?;
             requests.fetch_add(1, atomic::Ordering::SeqCst);
             Err(parse_redis_value(b"-TRYAGAIN mock\r\n"))
@@ -209,4 +213,71 @@ fn tryagain_exhaust_retries() {
         Err("TRYAGAIN: mock".to_string())
     );
     assert_eq!(requests.load(atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn rebuild_with_extra_nodes() {
+    let _ = env_logger::try_init();
+    let name = "rebuild_with_extra_nodes";
+
+    let requests = atomic::AtomicUsize::new(0);
+    let started = atomic::AtomicBool::new(false);
+    let MockEnv {
+        mut runtime,
+        connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], port| {
+        if !started.load(atomic::Ordering::SeqCst) {
+            respond_startup(name, cmd)?;
+        }
+        started.store(true, atomic::Ordering::SeqCst);
+
+        if contains_slice(&cmd, b"PING") {
+            return Err(Ok(Value::Status("OK".into())));
+        }
+
+        let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
+        eprintln!("{} => {}", i, String::from_utf8_lossy(cmd));
+
+        match i {
+            // Respond that the key exists elswehere (the slot, 123, is unused in the
+            // implementation)
+            0 => Err(parse_redis_value(b"-MOVED 123\r\n")),
+            // Respond with the new masters
+            1 => Err(Ok(Value::Bulk(vec![
+                Value::Bulk(vec![
+                    Value::Int(0),
+                    Value::Int(1),
+                    Value::Bulk(vec![
+                        Value::Data(name.as_bytes().to_vec()),
+                        Value::Int(6379),
+                    ]),
+                ]),
+                Value::Bulk(vec![
+                    Value::Int(2),
+                    Value::Int(16383),
+                    Value::Bulk(vec![
+                        Value::Data(name.as_bytes().to_vec()),
+                        Value::Int(6380),
+                    ]),
+                ]),
+            ]))),
+            _ => {
+                // Check that the correct node receives the request after rebuilding
+                assert_eq!(port, 6380);
+                Err(Ok(Value::Data(b"123".to_vec())))
+            }
+        }
+    });
+
+    let value = runtime
+        .block_on(
+            cmd("GET")
+                .arg("test")
+                .query_async::<_, Option<i32>>(connection),
+        )
+        .map(|(_, x)| x);;
+
+    assert_eq!(value, Ok(Some(123)));
 }
