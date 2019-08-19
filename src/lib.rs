@@ -94,10 +94,12 @@ use redis::{
 };
 
 const SLOT_SIZE: usize = 16384;
+const DEFAULT_RETRIES: u32 = 16;
 
 /// This is a Redis cluster client.
 pub struct Client {
     initial_nodes: Vec<ConnectionInfo>,
+    retries: Option<u32>,
 }
 
 impl Client {
@@ -121,7 +123,15 @@ impl Client {
 
         Ok(Client {
             initial_nodes: nodes,
+            retries: Some(DEFAULT_RETRIES),
         })
+    }
+
+    /// Set how many times we should retry a query. Set `None` to retry forever.
+    /// Default: 16
+    pub fn set_retries(&mut self, retries: Option<u32>) -> &mut Self {
+        self.retries = retries;
+        self
     }
 
     /// Open and get a Redis cluster connection.
@@ -130,7 +140,7 @@ impl Client {
     ///
     /// If it is failed to open connections and to create slots, an error is returned.
     pub fn get_connection(&self) -> impl ImplRedisFuture<Connection> {
-        Connection::new(self.initial_nodes.clone())
+        Connection::new(self.initial_nodes.clone(), self.retries)
     }
 
     #[doc(hidden)]
@@ -138,7 +148,7 @@ impl Client {
     where
         C: ConnectionLike + Connect + Clone + Send + 'static,
     {
-        Connection::new(self.initial_nodes.clone())
+        Connection::new(self.initial_nodes.clone(), self.retries)
     }
 }
 
@@ -150,8 +160,11 @@ impl<C> Connection<C>
 where
     C: ConnectionLike + Connect + Clone + Send + 'static,
 {
-    fn new(initial_nodes: Vec<ConnectionInfo>) -> impl ImplRedisFuture<Connection<C>> {
-        Pipeline::new(initial_nodes).map(|pipeline| {
+    fn new(
+        initial_nodes: Vec<ConnectionInfo>,
+        retries: Option<u32>,
+    ) -> impl ImplRedisFuture<Connection<C>> {
+        Pipeline::new(initial_nodes, retries).map(|pipeline| {
             let (tx, rx) = mpsc::channel(100);
             tokio_executor::spawn(rx.forward(pipeline).map(|_| ()));
             Connection(tx)
@@ -166,6 +179,7 @@ struct Pipeline<C> {
     slots: SlotMap,
     state: ConnectionState<C>,
     futures: Vec<Request<RedisFuture<(String, RedisResult<Vec<Value>>)>, Vec<Value>, C>>,
+    retries: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -213,7 +227,7 @@ enum RequestState<F> {
 }
 
 struct Request<F, I, C> {
-    retries: u32,
+    retries: Option<u32>,
     sender: Option<oneshot::Sender<RedisResult<I>>>,
     info: RequestInfo<C>,
     future: RequestState<F>,
@@ -252,10 +266,12 @@ where
             Ok(Async::Ready((addr, Err(err)))) => {
                 trace!("Request error {} {:?}", err, self.info.cmd.cmd);
 
-                self.retries -= 1;
-                if self.retries <= 0 {
-                    self.send(Err(err));
-                    return Ok(Async::Ready(Next::Done));
+                if let Some(retries) = &mut self.retries {
+                    if *retries == 0 {
+                        self.send(Err(err));
+                        return Ok(Async::Ready(Next::Done));
+                    }
+                    *retries -= 1;
                 }
 
                 if err.kind() == ErrorKind::ExtensionError {
@@ -267,10 +283,12 @@ where
                         return Err(err);
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
-                        let sleep_duration =
-                            Duration::from_millis(2u64.pow(16 - self.retries.max(9)) * 10);
+                        let sleep_duration = Duration::from_millis(
+                            2u64.pow(16 - self.retries.unwrap_or(9).max(9)) * 10,
+                        );
                         self.info.excludes.clear();
-                        return Ok(Async::Ready(Next::Delay(sleep_duration))); // FIXME Register delay
+                        return Ok(Async::Ready(Next::Delay(sleep_duration)));
+                        // FIXME Register delay
                     }
                 }
 
@@ -301,13 +319,14 @@ impl<C> Pipeline<C>
 where
     C: ConnectionLike + Connect + Clone + Send + 'static,
 {
-    fn new(initial_nodes: Vec<ConnectionInfo>) -> impl ImplRedisFuture<Self> {
-        Self::create_initial_connections(&initial_nodes).and_then(|connections| {
+    fn new(initial_nodes: Vec<ConnectionInfo>, retries: Option<u32>) -> impl ImplRedisFuture<Self> {
+        Self::create_initial_connections(&initial_nodes).and_then(move |connections| {
             let mut connection = Some(Pipeline {
                 connections,
                 slots: Default::default(),
                 futures: Vec::new(),
                 state: ConnectionState::PollComplete,
+                retries,
             });
             let mut refresh_slots_future = connection.as_mut().unwrap().refresh_slots();
             future::poll_fn(move || {
@@ -513,7 +532,6 @@ where
         trace!("start_send");
         let cmd = msg.cmd;
 
-        let retries = 16;
         let excludes = HashSet::new();
         let slot = slot_for_packed_command(&cmd.cmd);
 
@@ -524,7 +542,7 @@ where
             excludes,
         };
         let request = Request {
-            retries,
+            retries: self.retries,
             sender: Some(msg.sender),
             future: RequestState::None,
             info,

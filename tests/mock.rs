@@ -97,8 +97,9 @@ impl ConnectionLike for MockConnection {
 }
 
 pub struct MockEnv {
-    pub runtime: Runtime,
-    pub connection: redis_cluster_rs::Connection<MockConnection>,
+    runtime: Runtime,
+    client: redis_cluster_rs::Client,
+    connection: redis_cluster_rs::Connection<MockConnection>,
     #[allow(unused)]
     handler: RemoveHandler,
 }
@@ -124,15 +125,11 @@ impl MockEnv {
             .unwrap()
             .insert(id.clone(), Arc::new(handler));
 
-        let connection = runtime
-            .block_on(
-                Client::open(vec![&*format!("redis://{}", id)])
-                    .unwrap()
-                    .get_generic_connection(),
-            )
-            .unwrap();
+        let client = Client::open(vec![&*format!("redis://{}", id)]).unwrap();
+        let connection = runtime.block_on(client.get_generic_connection()).unwrap();
         MockEnv {
             runtime,
+            client,
             connection,
             handler: RemoveHandler(id),
         }
@@ -148,12 +145,13 @@ fn tryagain() {
     let MockEnv {
         mut runtime,
         connection,
-        handler: _,
+        handler: _handler,
+        ..
     } = MockEnv::new(name, move |cmd: &[u8]| {
         respond_startup(name, cmd)?;
 
         match requests.fetch_add(1, atomic::Ordering::SeqCst) {
-            0..=1 => Err(parse_redis_value(b"-TRYAGAIN 1\r\n")),
+            0..=1 => Err(parse_redis_value(b"-TRYAGAIN mock\r\n")),
             _ => Err(Ok(Value::Data(b"123".to_vec()))),
         }
     });
@@ -167,4 +165,48 @@ fn tryagain() {
         .map(|(_, x)| x);;
 
     assert_eq!(value, Ok(Some(123)));
+}
+
+#[test]
+fn tryagain_exhaust_retries() {
+    let _ = env_logger::try_init();
+    let name = "tryagain_exhaust_retries";
+
+    let requests = Arc::new(atomic::AtomicUsize::new(0));
+
+    let MockEnv {
+        mut runtime,
+        mut client,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, {
+        let requests = requests.clone();
+        move |cmd: &[u8]| {
+            respond_startup(name, cmd)?;
+            requests.fetch_add(1, atomic::Ordering::SeqCst);
+            Err(parse_redis_value(b"-TRYAGAIN mock\r\n"))
+        }
+    });
+
+    let connection = runtime
+        .block_on(
+            client
+                .set_retries(Some(2))
+                .get_generic_connection::<MockConnection>(),
+        )
+        .unwrap();
+
+    let result = runtime
+        .block_on(
+            cmd("GET")
+                .arg("test")
+                .query_async::<_, Option<i32>>(connection),
+        )
+        .map(|(_, x)| x);
+
+    assert_eq!(
+        result.map_err(|err| err.to_string()),
+        Err("TRYAGAIN: mock".to_string())
+    );
+    assert_eq!(requests.load(atomic::Ordering::SeqCst), 3);
 }
