@@ -139,12 +139,12 @@ impl Client {
     /// # Errors
     ///
     /// If it is failed to open connections and to create slots, an error is returned.
-    pub fn get_connection(&self) -> impl ImplRedisFuture<Connection> {
+    pub fn get_connection(&self) -> impl Future<Item = Connection, Error = RedisError> {
         Connection::new(self.initial_nodes.clone(), self.retries)
     }
 
     #[doc(hidden)]
-    pub fn get_generic_connection<C>(&self) -> impl ImplRedisFuture<Connection<C>>
+    pub fn get_generic_connection<C>(&self) -> impl Future<Item = Connection<C>, Error = RedisError>
     where
         C: ConnectionLike + Connect + Clone + Send + 'static,
     {
@@ -180,8 +180,8 @@ struct Pipeline<C> {
     state: ConnectionState<C>,
     in_flight_requests: Vec<
         Request<
-            Box<dyn Future<Item = (String, RedisResult<Vec<Value>>), Error = Void> + Send>,
-            Vec<Value>,
+            Box<dyn Future<Item = (String, RedisResult<Response>), Error = Void> + Send>,
+            Response,
             C,
         >,
     >,
@@ -195,10 +195,15 @@ struct CmdArg {
     count: usize,
 }
 
+enum Response {
+    Single(Value),
+    Multiple(Vec<Value>),
+}
+
 struct Message<C> {
     cmd: CmdArg,
-    sender: oneshot::Sender<RedisResult<Vec<Value>>>,
-    func: fn(C, CmdArg) -> RedisFuture<(C, Vec<Value>)>,
+    sender: oneshot::Sender<RedisResult<Response>>,
+    func: fn(C, CmdArg) -> RedisFuture<(C, Response)>,
 }
 
 enum ConnectionState<C> {
@@ -222,7 +227,7 @@ impl<C> fmt::Debug for ConnectionState<C> {
 struct RequestInfo<C> {
     cmd: CmdArg,
     slot: Option<u16>,
-    func: fn(C, CmdArg) -> RedisFuture<(C, Vec<Value>)>,
+    func: fn(C, CmdArg) -> RedisFuture<(C, Response)>,
     excludes: HashSet<String>,
 }
 
@@ -296,7 +301,6 @@ where
                         );
                         self.info.excludes.clear();
                         return Ok(Async::Ready(Next::Delay(sleep_duration)));
-                        // FIXME Register delay
                     }
                 }
 
@@ -515,7 +519,7 @@ where
     fn try_request(
         &mut self,
         info: &RequestInfo<C>,
-    ) -> impl Future<Item = (String, RedisResult<Vec<Value>>), Error = Void> {
+    ) -> impl Future<Item = (String, RedisResult<Response>), Error = Void> {
         let cmd = info.cmd.clone();
         let func = info.func;
         (if info.excludes.len() > 0 || info.slot.is_none() {
@@ -662,9 +666,9 @@ where
                     func: |conn, cmd| {
                         Box::new(
                             conn.req_packed_command(cmd.cmd)
-                                .map(|(conn, value)| (conn, vec![value])),
+                                .map(|(conn, value)| (conn, Response::Single(value))),
                         )
-                    }, // FIXME Slow
+                    },
                 })
                 .map_err(|_| {
                     RedisError::from(io::Error::new(
@@ -681,7 +685,15 @@ where
                                     "redis_cluster: Unable to receive command",
                                 )))
                             })
-                            .map(|mut vec| (self, vec.pop().unwrap()))
+                            .map(|response| {
+                                (
+                                    self,
+                                    match response {
+                                        Response::Single(value) => value,
+                                        Response::Multiple(_) => unreachable!(),
+                                    },
+                                )
+                            })
                     })
                 }),
         )
@@ -700,7 +712,12 @@ where
                 .send(Message {
                     cmd: CmdArg { cmd, offset, count },
                     sender,
-                    func: |conn, cmd| conn.req_packed_commands(cmd.cmd, cmd.offset, cmd.count),
+                    func: |conn, cmd| {
+                        Box::new(
+                            conn.req_packed_commands(cmd.cmd, cmd.offset, cmd.count)
+                                .map(|(conn, values)| (conn, Response::Multiple(values))),
+                        )
+                    },
                 })
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
                 .and_then(move |_| {
@@ -709,7 +726,15 @@ where
                             .unwrap_or_else(|_| {
                                 Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
                             })
-                            .map(|vec| (self, vec))
+                            .map(|response| {
+                                (
+                                    self,
+                                    match response {
+                                        Response::Multiple(values) => values,
+                                        Response::Single(_) => unreachable!(),
+                                    },
+                                )
+                            })
                     })
                 }),
         )
@@ -747,8 +772,7 @@ where
     Box::new(f)
 }
 
-// FIXME Don't be public
-pub trait ImplRedisFuture<T>: Future<Item = T, Error = RedisError> {}
+trait ImplRedisFuture<T>: Future<Item = T, Error = RedisError> {}
 impl<T, F> ImplRedisFuture<T> for F where F: Future<Item = T, Error = RedisError> {}
 
 pub trait Connect {
