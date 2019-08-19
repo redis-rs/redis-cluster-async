@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{atomic, Arc, RwLock},
 };
 
 use {
@@ -143,6 +143,8 @@ impl MockEnv {
 fn tryagain() {
     let _ = env_logger::try_init();
     let name = "tryagain";
+
+    let requests = atomic::AtomicUsize::new(0);
     let MockEnv {
         mut runtime,
         connection,
@@ -150,15 +152,19 @@ fn tryagain() {
     } = MockEnv::new(name, move |cmd: &[u8]| {
         respond_startup(name, cmd)?;
 
-        Err(parse_redis_value(b"-MOVED 1\r\n"))
+        match requests.fetch_add(1, atomic::Ordering::SeqCst) {
+            0..=1 => Err(parse_redis_value(b"-TRYAGAIN 1\r\n")),
+            _ => Err(Ok(Value::Data(b"123".to_vec()))),
+        }
     });
 
-    runtime
+    let value = runtime
         .block_on(
             cmd("GET")
                 .arg("test")
                 .query_async::<_, Option<i32>>(connection),
         )
-        .map(|(_, x)| x)
-        .unwrap_err();
+        .map(|(_, x)| x);;
+
+    assert_eq!(value, Ok(Some(123)));
 }
