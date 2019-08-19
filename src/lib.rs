@@ -178,7 +178,7 @@ struct Pipeline<C> {
     connections: HashMap<String, C>,
     slots: SlotMap,
     state: ConnectionState<C>,
-    futures: Vec<
+    in_flight_requests: Vec<
         Request<
             Box<dyn Future<Item = (String, RedisResult<Vec<Value>>), Error = Void> + Send>,
             Vec<Value>,
@@ -332,7 +332,7 @@ where
             let mut connection = Some(Pipeline {
                 connections,
                 slots: Default::default(),
-                futures: Vec::new(),
+                in_flight_requests: Vec::new(),
                 state: ConnectionState::PollComplete,
                 retries,
             });
@@ -384,7 +384,6 @@ where
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(&mut self) -> impl ImplRedisFuture<(SlotMap, HashMap<String, C>)> {
         let slots_future = {
-            // TODO redis_cluster_rs used `sample_iter` here which didn't seem to actually do anything?
             let samples = self.connections.values().cloned().collect::<Vec<_>>();
 
             stream::iter_ok(samples)
@@ -557,7 +556,7 @@ where
             future: RequestState::None,
             info,
         };
-        self.futures.push(request);
+        self.in_flight_requests.push(request);
         Ok(AsyncSink::Ready)
     }
 
@@ -583,43 +582,43 @@ where
                     let mut error = None;
                     let mut i = 0;
 
-                    while i < self.futures.len() {
-                        if let RequestState::None = self.futures[i].future {
-                            let mut request = self.futures.swap_remove(i);
+                    while i < self.in_flight_requests.len() {
+                        if let RequestState::None = self.in_flight_requests[i].future {
+                            let mut request = self.in_flight_requests.swap_remove(i);
                             request.future =
                                 RequestState::Future(Box::new(self.try_request(&request.info)));
-                            self.futures.push(request);
-                            if self.futures.len() != 1 {
-                                let last = self.futures.len() - 1;
-                                self.futures.swap(i, last);
+                            self.in_flight_requests.push(request);
+                            if self.in_flight_requests.len() != 1 {
+                                let last = self.in_flight_requests.len() - 1;
+                                self.in_flight_requests.swap(i, last);
                             }
                         }
-                        match self.futures[i].poll_request(self.connections.len()) {
+                        match self.in_flight_requests[i].poll_request(self.connections.len()) {
                             Ok(Async::NotReady) => {
                                 i += 1;
                             }
                             Ok(Async::Ready(next)) => match next {
                                 Next::Delay(duration) => {
-                                    let mut request = self.futures.swap_remove(i);
+                                    let mut request = self.in_flight_requests.swap_remove(i);
                                     request.future =
                                         RequestState::Delay(tokio_timer::sleep(duration));
-                                    self.futures.push(request);
+                                    self.in_flight_requests.push(request);
                                 }
                                 Next::Done => {
-                                    self.futures.swap_remove(i);
+                                    self.in_flight_requests.swap_remove(i);
                                 }
                                 Next::TryNewConnection => {
-                                    let mut request = self.futures.swap_remove(i);
+                                    let mut request = self.in_flight_requests.swap_remove(i);
                                     request.future = RequestState::Future(Box::new(
                                         self.try_request(&request.info),
                                     ));
-                                    self.futures.push(request);
+                                    self.in_flight_requests.push(request);
                                 }
                             },
                             Err(err) => {
                                 error = Some(err);
 
-                                self.futures[i].future = RequestState::None;
+                                self.in_flight_requests[i].future = RequestState::None;
                                 i += 1;
                             }
                         }
@@ -628,7 +627,7 @@ where
                     if let Some(err) = error {
                         trace!("Recovering {}", err);
                         ConnectionState::Recover(Box::new(self.refresh_slots()))
-                    } else if self.futures.is_empty() {
+                    } else if self.in_flight_requests.is_empty() {
                         return Ok(Async::Ready(()));
                     } else {
                         return Ok(Async::NotReady);
@@ -830,6 +829,8 @@ fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
         })
 }
 
+// If a key contains `{` and `}`, everything between the first occurence is the only thing that
+// determines the hash slot
 fn sub_key(key: &[u8]) -> &[u8] {
     key.iter()
         .position(|b| *b == b'{')
