@@ -1,11 +1,11 @@
 [package]
-name = "redis_cluster_rs"
-version = "0.1.5"
-authors = ["Atsushi Koge <atuk721@gmail.com>"]
-keywords = ["redis", "cluster", "database"]
-description = "Redis cluster driver for Rust."
-homepage = "https://github.com/atuk721/redis-cluster-rs"
-repository = "https://github.com/atuk721/redis-cluster-rs"
+name = "redis_cluster_async"
+version = "0.1.0"
+authors = ["Markus Westerlind <marwes91@gmail.com>"]
+keywords = ["redis", "cluster", "database", "async"]
+description = "Async redis cluster driver for Rust."
+homepage = "https://github.com/Marwes/redis-cluster-async"
+repository = "https://github.com/Marwes/redis-cluster-async"
 license = "MIT"
 readme = "README.md"
 

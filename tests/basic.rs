@@ -9,7 +9,7 @@ use {
     tokio::{prelude::*, runtime::current_thread::Runtime},
 };
 
-use redis_cluster_rs::{
+use redis_cluster_async::{
     redis::{cmd, RedisError},
     Client,
 };
@@ -177,7 +177,7 @@ fn basic_failover() {
 
 struct FailoverEnv {
     env: RedisEnv,
-    connection: redis_cluster_rs::Connection,
+    connection: redis_cluster_async::Connection,
 }
 
 impl FailoverEnv {

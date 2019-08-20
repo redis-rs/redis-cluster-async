@@ -9,13 +9,9 @@
 //!
 //! # Example
 //! ```rust
-//! extern crate redis_cluster_rs;
-//! extern crate tokio;
-//!
-//!
 //! use tokio::{prelude::*, runtime::current_thread::Runtime};
 //!
-//! use redis_cluster_rs::{Client, redis::{Commands, cmd}};
+//! use redis_cluster_async::{Client, redis::{Commands, cmd}};
 //!
 //! fn main() {
 //! #   let _ = env_logger::try_init();
@@ -39,12 +35,9 @@
 //!
 //! # Pipelining
 //! ```rust
-//! extern crate redis_cluster_rs;
-//! extern crate tokio;
-//!
 //! use tokio::{prelude::*, runtime::current_thread::Runtime};
 //!
-//! use redis_cluster_rs::{Client, redis::{PipelineCommands, pipe}};
+//! use redis_cluster_async::{Client, redis::{PipelineCommands, pipe}};
 //!
 //! fn main() {
 //! #   let _ = env_logger::try_init();
@@ -272,7 +265,7 @@ where
         match future.poll() {
             Ok(Async::Ready((_, Ok(item)))) => {
                 trace!("Ok");
-                self.send(Ok(item));
+                self.respond(Ok(item));
                 Ok(Async::Ready(Next::Done))
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
@@ -281,7 +274,7 @@ where
 
                 if let Some(retries) = &mut self.retries {
                     if *retries == 0 {
-                        self.send(Err(err));
+                        self.respond(Err(err));
                         return Ok(Async::Ready(Next::Done));
                     }
                     *retries -= 1;
@@ -307,7 +300,7 @@ where
                 self.info.excludes.insert(addr);
 
                 if self.info.excludes.len() >= connections_len {
-                    self.send(Err(err));
+                    self.respond(Err(err));
                     return Ok(Async::Ready(Next::Done));
                 }
 
@@ -317,7 +310,7 @@ where
         }
     }
 
-    fn send(&mut self, msg: RedisResult<I>) {
+    fn respond(&mut self, msg: RedisResult<I>) {
         // If `send` errors the receiver has dropped and thus does not care about the message
         let _ = self
             .sender

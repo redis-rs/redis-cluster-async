@@ -5,7 +5,7 @@ use std::{
 
 use {
     futures::future,
-    redis_cluster_rs::{
+    redis_cluster_async::{
         redis::{
             aio::ConnectionLike, cmd, parse_redis_value, IntoConnectionInfo, RedisFuture,
             RedisResult, Value,
@@ -102,8 +102,8 @@ impl ConnectionLike for MockConnection {
 
 pub struct MockEnv {
     runtime: Runtime,
-    client: redis_cluster_rs::Client,
-    connection: redis_cluster_rs::Connection<MockConnection>,
+    client: redis_cluster_async::Client,
+    connection: redis_cluster_async::Connection<MockConnection>,
     #[allow(unused)]
     handler: RemoveHandler,
 }
