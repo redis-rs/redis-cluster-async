@@ -844,12 +844,13 @@ fn sub_key(key: &[u8]) -> &[u8] {
     key.iter()
         .position(|b| *b == b'{')
         .and_then(|open| {
-            key[open + 1..]
+            let after_open = open + 1;
+            key[after_open..]
                 .iter()
                 .position(|b| *b == b'}')
-                .and_then(|close| {
-                    if close != 0 {
-                        Some(&key[open + 1..open + close + 1])
+                .and_then(|close_offset| {
+                    if close_offset != 0 {
+                        Some(&key[after_open..after_open + close_offset])
                     } else {
                         None
                     }
