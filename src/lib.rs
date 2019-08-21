@@ -281,9 +281,7 @@ where
                 }
                 self.retry = self.retry.saturating_add(1);
 
-                if err.kind() == ErrorKind::ExtensionError {
-                    let error_code = err.extension_error_code().unwrap();
-
+                if let Some(error_code) = err.extension_error_code() {
                     if error_code == "MOVED" || error_code == "ASK" {
                         // Refresh slots and request again.
                         self.info.excludes.clear();
