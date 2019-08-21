@@ -231,7 +231,8 @@ enum RequestState<F> {
 }
 
 struct Request<F, I, C> {
-    retries: Option<u32>,
+    retry: u32,
+    max_retries: Option<u32>,
     sender: Option<oneshot::Sender<RedisResult<I>>>,
     info: RequestInfo<C>,
     future: RequestState<F>,
@@ -272,13 +273,14 @@ where
             Ok(Async::Ready((addr, Err(err)))) => {
                 trace!("Request error {} {:?}", err, self.info.cmd.cmd);
 
-                if let Some(retries) = &mut self.retries {
-                    if *retries == 0 {
+                match self.max_retries {
+                    Some(max_retries) if self.retry == max_retries => {
                         self.respond(Err(err));
                         return Ok(Async::Ready(Next::Done));
                     }
-                    *retries -= 1;
+                    _ => (),
                 }
+                self.retry = self.retry.saturating_add(1);
 
                 if err.kind() == ErrorKind::ExtensionError {
                     let error_code = err.extension_error_code().unwrap();
@@ -289,9 +291,8 @@ where
                         return Err(err);
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
-                        let sleep_duration = Duration::from_millis(
-                            2u64.pow(16 - self.retries.unwrap_or(9).max(9)) * 10,
-                        );
+                        let sleep_duration =
+                            Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
                         self.info.excludes.clear();
                         return Ok(Async::Ready(Next::Delay(sleep_duration)));
                     }
@@ -552,7 +553,8 @@ where
             excludes,
         };
         let request = Request {
-            retries: self.retries,
+            max_retries: self.retries,
+            retry: 0,
             sender: Some(msg.sender),
             future: RequestState::None,
             info,
