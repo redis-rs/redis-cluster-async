@@ -483,10 +483,7 @@ where
         Ok(slot_map)
     }
 
-    fn get_connection(
-        &mut self,
-        slot: u16,
-    ) -> impl Future<Item = (String, C), Error = Void> + 'static {
+    fn get_connection(&self, slot: u16) -> impl Future<Item = (String, C), Error = Void> + 'static {
         if let Some((_, addr)) = self.slots.range(&slot..).next() {
             if self.connections.contains_key(addr) {
                 return future::Either::A(future::ok((
@@ -511,9 +508,10 @@ where
     }
 
     fn try_request(
-        &mut self,
+        &self,
         info: &RequestInfo<C>,
     ) -> impl Future<Item = (String, RedisResult<Response>), Error = Void> {
+        // TODO remove clone by changing the ConnectionLike trait
         let cmd = info.cmd.clone();
         let func = info.func;
         (if info.excludes.len() > 0 || info.slot.is_none() {
@@ -547,7 +545,7 @@ where
         let slot = slot_for_packed_command(&cmd.cmd);
 
         let info = RequestInfo {
-            cmd: cmd.clone(), // TODO remove clone
+            cmd,
             func: msg.func,
             slot,
             excludes,
@@ -587,15 +585,11 @@ where
 
                     while i < self.in_flight_requests.len() {
                         if let RequestState::None = self.in_flight_requests[i].future {
-                            let mut request = self.in_flight_requests.swap_remove(i);
-                            request.future =
-                                RequestState::Future(Box::new(self.try_request(&request.info)));
-                            self.in_flight_requests.push(request);
-                            if self.in_flight_requests.len() != 1 {
-                                let last = self.in_flight_requests.len() - 1;
-                                self.in_flight_requests.swap(i, last);
-                            }
+                            let future = self.try_request(&self.in_flight_requests[i].info);
+                            self.in_flight_requests[i].future =
+                                RequestState::Future(Box::new(future));
                         }
+
                         match self.in_flight_requests[i].poll_request(self.connections.len()) {
                             Ok(Async::NotReady) => {
                                 i += 1;
