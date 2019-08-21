@@ -241,7 +241,6 @@ struct Request<F, I, C> {
 #[must_use]
 enum Next {
     TryNewConnection,
-    Delay(Duration),
     Done,
 }
 
@@ -294,7 +293,8 @@ where
                         let sleep_duration =
                             Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
                         self.info.excludes.clear();
-                        return Ok(Async::Ready(Next::Delay(sleep_duration)));
+                        self.future = RequestState::Delay(tokio_timer::sleep(sleep_duration));
+                        return self.poll_request(connections_len);
                     }
                 }
 
@@ -595,12 +595,6 @@ where
                                 i += 1;
                             }
                             Ok(Async::Ready(next)) => match next {
-                                Next::Delay(duration) => {
-                                    let mut request = self.in_flight_requests.swap_remove(i);
-                                    request.future =
-                                        RequestState::Delay(tokio_timer::sleep(duration));
-                                    self.in_flight_requests.push(request);
-                                }
                                 Next::Done => {
                                     self.in_flight_requests.swap_remove(i);
                                 }
