@@ -136,7 +136,7 @@ impl RedisEnv {
 }
 
 #[test]
-fn basic() {
+fn basic_cmd() {
     let mut env = RedisEnv::new();
     let client = env.client;
     env.runtime
@@ -152,6 +152,34 @@ fn basic() {
                     })
                     .map(|(_, res): (_, String)| {
                         assert_eq!(res, "test_data");
+                    })
+            })
+        }))
+        .unwrap()
+}
+
+#[ignore] // TODO Handle pipe where the keys do not all go to the same node
+#[test]
+fn basic_pipe() {
+    let mut env = RedisEnv::new();
+    let client = env.client;
+    env.runtime
+        .block_on(future::lazy(|| {
+            client.get_connection().and_then(|connection| {
+                let mut pipe = redis::pipe();
+                pipe.add_command(cmd("SET").arg("test").arg("test_data").clone());
+                pipe.add_command(cmd("SET").arg("test3").arg("test_data3").clone());
+                pipe.query_async(connection)
+                    .and_then(|(connection, ())| {
+                        cmd("GET").arg("test").clone().query_async(connection)
+                    })
+                    .map(|(connection, res): (_, String)| {
+                        assert_eq!(res, "test_data");
+                        connection
+                    })
+                    .and_then(|connection| cmd("GET").arg("test3").clone().query_async(connection))
+                    .map(|(_, res): (_, String)| {
+                        assert_eq!(res, "test_data3");
                     })
             })
         }))
