@@ -12,10 +12,10 @@ use {
         },
         Client, Connect,
     },
-    tokio::runtime::current_thread::Runtime,
+    tokio::runtime::Runtime,
 };
 
-type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
+type Handler = Arc<dyn Fn(&redis::Cmd, u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
 
 lazy_static::lazy_static! {
     static ref HANDLERS: RwLock<HashMap<String, Handler>>
@@ -29,9 +29,9 @@ pub struct MockConnection {
 }
 
 impl Connect for MockConnection {
-    fn connect<T>(info: T) -> RedisFuture<Self>
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
     where
-        T: IntoConnectionInfo,
+        T: IntoConnectionInfo + Send + 'a,
     {
         let info = info.into_connection_info().unwrap();
 
@@ -39,7 +39,7 @@ impl Connect for MockConnection {
             redis::ConnectionAddr::Tcp(addr, port) => (addr, *port),
             _ => unreachable!(),
         };
-        Box::new(future::ok(MockConnection {
+        Box::pin(future::ok(MockConnection {
             handler: HANDLERS
                 .read()
                 .unwrap()
@@ -78,21 +78,19 @@ fn respond_startup(name: &str, cmd: &[u8]) -> Result<(), RedisResult<Value>> {
 }
 
 impl ConnectionLike for MockConnection {
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
-        Box::new(future::result(
-            (self.handler)(&cmd, self.port)
-                .expect_err("Handler did not specify a response")
-                .map(|value| (self, value)),
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> RedisFuture<'a, Value> {
+        Box::pin(future::ready(
+            (self.handler)(&cmd, self.port).expect_err("Handler did not specify a response"),
         ))
     }
 
-    fn req_packed_commands(
-        self,
-        _cmd: Vec<u8>,
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        _pipeline: &'a redis::Pipeline,
         _offset: usize,
         _count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
-        Box::new(future::ok((self, vec![])))
+    ) -> RedisFuture<'a, Vec<Value>> {
+        Box::pin(future::ok(vec![]))
     }
 
     fn get_db(&self) -> i64 {
@@ -121,13 +119,18 @@ impl MockEnv {
         id: &str,
         handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
     ) -> Self {
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
 
         let id = id.to_string();
-        HANDLERS
-            .write()
-            .unwrap()
-            .insert(id.clone(), Arc::new(handler));
+        HANDLERS.write().unwrap().insert(
+            id.clone(),
+            Arc::new(move |cmd, port| handler(&cmd.get_packed_command(), port)),
+        );
 
         let client = Client::open(vec![&*format!("redis://{}", id)]).unwrap();
         let connection = runtime.block_on(client.get_generic_connection()).unwrap();
@@ -148,7 +151,7 @@ fn tryagain_simple() {
     let requests = atomic::AtomicUsize::new(0);
     let MockEnv {
         mut runtime,
-        connection,
+        mut connection,
         handler: _handler,
         ..
     } = MockEnv::new(name, move |cmd: &[u8], _| {
@@ -160,13 +163,11 @@ fn tryagain_simple() {
         }
     });
 
-    let value = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let value = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(value, Ok(Some(123)));
 }
@@ -192,7 +193,7 @@ fn tryagain_exhaust_retries() {
         }
     });
 
-    let connection = runtime
+    let mut connection = runtime
         .block_on(
             client
                 .set_retries(Some(2))
@@ -200,13 +201,11 @@ fn tryagain_exhaust_retries() {
         )
         .unwrap();
 
-    let result = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let result = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(
         result.map_err(|err| err.to_string()),
@@ -224,7 +223,7 @@ fn rebuild_with_extra_nodes() {
     let started = atomic::AtomicBool::new(false);
     let MockEnv {
         mut runtime,
-        connection,
+        mut connection,
         handler: _handler,
         ..
     } = MockEnv::new(name, move |cmd: &[u8], port| {
@@ -271,13 +270,11 @@ fn rebuild_with_extra_nodes() {
         }
     });
 
-    let value = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let value = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(value, Ok(Some(123)));
 }

@@ -13,15 +13,14 @@ edition = "2018"
 
 [dependencies]
 crc16 = "0.4"
-futures = "0.1"
+futures = "0.3"
 rand = "0.7"
-redis = ">=0.11,<=0.13"
-tokio-executor = "0.1"
-tokio-timer = "0.2"
+redis = { git = "https://github.com/Marwes/redis-rs", branch = "async_await_api", features = ["tokio-rt-core"] }
+tokio = { version = "0.2", features = ["time"] }
 log = "0.4"
 
 [dev-dependencies]
 lazy_static = "1"
-tokio = "0.1"
+tokio = { version = "0.2", features = ["macros"] }
 env_logger = "0.7"
 proptest = "0.9"

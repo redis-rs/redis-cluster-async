@@ -9,54 +9,42 @@
 //!
 //! # Example
 //! ```rust
-//! use tokio::{prelude::*, runtime::current_thread::Runtime};
-//!
 //! use redis_cluster_async::{Client, redis::{Commands, cmd}};
 //!
-//! fn main() {
+//! #[tokio::main]
+//! async fn main() -> redis::RedisResult<()> {
 //! #   let _ = env_logger::try_init();
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
-//!     let mut runtime = Runtime::new().unwrap();
-//!     runtime.block_on(future::lazy(|| {
-//!         let client = Client::open(nodes).unwrap();
-//!         client.get_connection().and_then(|connection| {
-//!             cmd("SET").arg("test").arg("test_data").clone().query_async(connection)
-//!                 .and_then(|(connection, ())| {
-//!                     cmd("GET").arg("test").clone().query_async(connection)
-//!                 })
-//!                 .map(|(_, res): (_, String)| {
-//!                     assert_eq!(res, "test_data");
-//!                 })
-//!         })
-//!     })).unwrap()
+//!     let client = Client::open(nodes)?;
+//!     let mut connection = client.get_connection().await?;
+//!     cmd("SET").arg("test").arg("test_data").query_async(&mut connection).await?;
+//!     let res: String = cmd("GET").arg("test").query_async(&mut connection).await?;
+//!     assert_eq!(res, "test_data");
+//!     Ok(())
 //! }
 //! ```
 //!
 //! # Pipelining
 //! ```rust
-//! use tokio::{prelude::*, runtime::current_thread::Runtime};
-//!
 //! use redis_cluster_async::{Client, redis::{PipelineCommands, pipe}};
 //!
-//! fn main() {
+//! #[tokio::main]
+//! async fn main() -> redis::RedisResult<()> {
 //! #   let _ = env_logger::try_init();
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
-//!     let mut runtime = Runtime::new().unwrap();
-//!     runtime.block_on(future::lazy(|| {
-//!         let client = Client::open(nodes).unwrap();
-//!         client.get_connection().and_then(|connection| {
-//!             let key = "test2";
+//!     let client = Client::open(nodes)?;
+//!     let mut connection = client.get_connection().await?;
+//!     let key = "test2";
 //!
-//!             let mut pipe = pipe();
-//!             pipe.rpush(key, "123").ignore()
-//!                 .ltrim(key, -10, -1).ignore()
-//!                 .expire(key, 60).ignore();
-//!             pipe.query_async(connection)
-//!                 .map(|(_, ())| ())
-//!         })
-//!     })).unwrap();
+//!     let mut pipe = pipe();
+//!     pipe.rpush(key, "123").ignore()
+//!         .ltrim(key, -10, -1).ignore()
+//!         .expire(key, 60).ignore();
+//!     pipe.query_async(&mut connection)
+//!         .await?;
+//!     Ok(())
 //! }
 //! ```
 
@@ -66,17 +54,20 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, io,
     iter::Iterator,
+    marker::Unpin,
     mem,
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
 use crc16::*;
 use futures::{
-    future,
+    channel::{mpsc, oneshot},
+    future::{self, BoxFuture},
     prelude::*,
-    stream,
-    sync::{mpsc, oneshot},
-    try_ready, StartSend,
+    ready, stream,
+    task::{self, Poll},
 };
 use log::trace;
 use rand::seq::IteratorRandom;
@@ -132,36 +123,38 @@ impl Client {
     /// # Errors
     ///
     /// If it is failed to open connections and to create slots, an error is returned.
-    pub fn get_connection(&self) -> impl Future<Item = Connection, Error = RedisError> {
-        Connection::new(self.initial_nodes.clone(), self.retries)
+    pub async fn get_connection(&self) -> RedisResult<Connection> {
+        Connection::new(&self.initial_nodes, self.retries).await
     }
 
     #[doc(hidden)]
-    pub fn get_generic_connection<C>(&self) -> impl Future<Item = Connection<C>, Error = RedisError>
+    pub async fn get_generic_connection<C>(&self) -> RedisResult<Connection<C>>
     where
-        C: ConnectionLike + Connect + Clone + Send + 'static,
+        C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
     {
-        Connection::new(self.initial_nodes.clone(), self.retries)
+        Connection::new(&self.initial_nodes, self.retries).await
     }
 }
 
 /// This is a connection of Redis cluster.
 #[derive(Clone)]
-pub struct Connection<C = redis::aio::SharedConnection>(mpsc::Sender<Message<C>>);
+pub struct Connection<C = redis::aio::MultiplexedConnection>(mpsc::Sender<Message<C>>);
 
 impl<C> Connection<C>
 where
-    C: ConnectionLike + Connect + Clone + Send + 'static,
+    C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
 {
-    fn new(
-        initial_nodes: Vec<ConnectionInfo>,
+    async fn new(
+        initial_nodes: &[ConnectionInfo],
         retries: Option<u32>,
-    ) -> impl ImplRedisFuture<Connection<C>> {
-        Pipeline::new(initial_nodes, retries).map(|pipeline| {
-            let (tx, rx) = mpsc::channel(100);
-            tokio_executor::spawn(rx.forward(pipeline).map(|_| ()));
-            Connection(tx)
-        })
+    ) -> RedisResult<Connection<C>> {
+        Pipeline::new(initial_nodes, retries)
+            .map_ok(|pipeline| {
+                let (tx, rx) = mpsc::channel::<Message<_>>(100);
+                tokio::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
+                Connection(tx)
+            })
+            .await
     }
 }
 
@@ -171,21 +164,59 @@ struct Pipeline<C> {
     connections: HashMap<String, C>,
     slots: SlotMap,
     state: ConnectionState<C>,
-    in_flight_requests: Vec<
-        Request<
-            Box<dyn Future<Item = (String, RedisResult<Response>), Error = Void> + Send>,
-            Response,
-            C,
-        >,
-    >,
+    in_flight_requests:
+        Vec<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>,
     retries: Option<u32>,
 }
 
 #[derive(Clone)]
-struct CmdArg {
-    cmd: Vec<u8>,
-    offset: usize,
-    count: usize,
+enum CmdArg<C> {
+    Cmd {
+        cmd: Arc<redis::Cmd>,
+        func: fn(C, Arc<redis::Cmd>) -> RedisFuture<'static, Response>,
+    },
+    Pipeline {
+        pipeline: Arc<redis::Pipeline>,
+        offset: usize,
+        count: usize,
+        func: fn(C, Arc<redis::Pipeline>, usize, usize) -> RedisFuture<'static, Response>,
+    },
+}
+
+impl<C> CmdArg<C> {
+    fn exec(&self, con: C) -> RedisFuture<'static, Response> {
+        match self {
+            Self::Cmd { cmd, func } => func(con, cmd.clone()),
+            Self::Pipeline {
+                pipeline,
+                offset,
+                count,
+                func,
+            } => func(con, pipeline.clone(), *offset, *count),
+        }
+    }
+
+    fn slot(&self) -> Option<u16> {
+        fn slot_for_command(cmd: &Cmd) -> Option<u16> {
+            cmd.args_iter().nth(1).and_then(|arg| match arg {
+                redis::Arg::Simple(key) => Some(slot_for_key(key)),
+                redis::Arg::Cursor => None, // FIXME ???
+            })
+        }
+        match self {
+            Self::Cmd { cmd, .. } => slot_for_command(cmd),
+            Self::Pipeline { pipeline, .. } => {
+                let mut iter = pipeline.cmd_iter();
+                let slot = iter.next().map(slot_for_command)?;
+                for cmd in iter {
+                    if slot != slot_for_command(cmd) {
+                        return None;
+                    }
+                }
+                slot
+            }
+        }
+    }
 }
 
 enum Response {
@@ -194,14 +225,13 @@ enum Response {
 }
 
 struct Message<C> {
-    cmd: CmdArg,
+    cmd: CmdArg<C>,
     sender: oneshot::Sender<RedisResult<Response>>,
-    func: fn(C, CmdArg) -> RedisFuture<(C, Response)>,
 }
 
 enum ConnectionState<C> {
     PollComplete,
-    Recover(RedisFuture<(SlotMap, HashMap<String, C>)>),
+    Recover(RedisFuture<'static, (SlotMap, HashMap<String, C>)>),
 }
 
 impl<C> fmt::Debug for ConnectionState<C> {
@@ -218,16 +248,15 @@ impl<C> fmt::Debug for ConnectionState<C> {
 }
 
 struct RequestInfo<C> {
-    cmd: CmdArg,
+    cmd: CmdArg<C>,
     slot: Option<u16>,
-    func: fn(C, CmdArg) -> RedisFuture<(C, Response)>,
     excludes: HashSet<String>,
 }
 
 enum RequestState<F> {
     None,
     Future(F),
-    Delay(tokio_timer::Delay),
+    Delay(tokio::time::Delay),
 }
 
 struct Request<F, I, C> {
@@ -244,38 +273,39 @@ enum Next {
     Done,
 }
 
-enum Void {}
-
 impl<F, I, C> Request<F, I, C>
 where
-    F: Future<Item = (String, RedisResult<I>), Error = Void>,
+    F: Future<Output = (String, RedisResult<I>)> + Unpin,
     C: ConnectionLike,
 {
-    fn poll_request(&mut self, connections_len: usize) -> Poll<Next, RedisError> {
+    fn poll_request(
+        &mut self,
+        cx: &mut task::Context,
+        connections_len: usize,
+    ) -> Poll<Result<Next, RedisError>> {
         let future = match &mut self.future {
-            RequestState::Future(f) => f,
+            RequestState::Future(f) => Pin::new(f),
             RequestState::Delay(delay) => {
-                return Ok(match delay.poll() {
-                    Ok(Async::Ready(_)) | Err(_) => Next::TryNewConnection.into(),
-                    Ok(Async::NotReady) => Async::NotReady,
-                });
+                return Ok(match ready!(Pin::new(delay).poll(cx)) {
+                    () => Next::TryNewConnection,
+                })
+                .into();
             }
             _ => panic!("Request future must be Some"),
         };
-        match future.poll() {
-            Ok(Async::Ready((_, Ok(item)))) => {
+        match ready!(future.poll(cx)) {
+            (_, Ok(item)) => {
                 trace!("Ok");
                 self.respond(Ok(item));
-                Ok(Async::Ready(Next::Done))
+                Ok(Next::Done).into()
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Ok(Async::Ready((addr, Err(err)))) => {
-                trace!("Request error {} {:?}", err, self.info.cmd.cmd);
+            (addr, Err(err)) => {
+                trace!("Request error {}", err);
 
                 match self.max_retries {
                     Some(max_retries) if self.retry == max_retries => {
                         self.respond(Err(err));
-                        return Ok(Async::Ready(Next::Done));
+                        return Ok(Next::Done).into();
                     }
                     _ => (),
                 }
@@ -285,14 +315,14 @@ where
                     if error_code == "MOVED" || error_code == "ASK" {
                         // Refresh slots and request again.
                         self.info.excludes.clear();
-                        return Err(err);
+                        return Err(err).into();
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
                         let sleep_duration =
                             Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
                         self.info.excludes.clear();
-                        self.future = RequestState::Delay(tokio_timer::sleep(sleep_duration));
-                        return self.poll_request(connections_len);
+                        self.future = RequestState::Delay(tokio::time::delay_for(sleep_duration));
+                        return self.poll_request(cx, connections_len);
                     }
                 }
 
@@ -300,12 +330,11 @@ where
 
                 if self.info.excludes.len() >= connections_len {
                     self.respond(Err(err));
-                    return Ok(Async::Ready(Next::Done));
+                    return Ok(Next::Done).into();
                 }
 
-                Ok(Async::Ready(Next::TryNewConnection))
+                Ok(Next::TryNewConnection).into()
             }
-            Err(void) => match void {},
         }
     }
 
@@ -323,50 +352,46 @@ impl<C> Pipeline<C>
 where
     C: ConnectionLike + Connect + Clone + Send + 'static,
 {
-    fn new(initial_nodes: Vec<ConnectionInfo>, retries: Option<u32>) -> impl ImplRedisFuture<Self> {
-        Self::create_initial_connections(&initial_nodes).and_then(move |connections| {
-            let mut connection = Some(Pipeline {
-                connections,
-                slots: Default::default(),
-                in_flight_requests: Vec::new(),
-                state: ConnectionState::PollComplete,
-                retries,
-            });
-            let mut refresh_slots_future = connection.as_mut().unwrap().refresh_slots();
-            future::poll_fn(move || {
-                let (slots, connections) = try_ready!(refresh_slots_future.poll());
-                let mut connection = connection.take().unwrap();
-                connection.slots = slots;
-                connection.connections = connections;
-                Ok(connection.into())
-            })
-        })
+    async fn new(initial_nodes: &[ConnectionInfo], retries: Option<u32>) -> RedisResult<Self> {
+        let connections = Self::create_initial_connections(initial_nodes).await?;
+        let mut connection = Pipeline {
+            connections,
+            slots: Default::default(),
+            in_flight_requests: Vec::new(),
+            state: ConnectionState::PollComplete,
+            retries,
+        };
+        let (slots, connections) = connection.refresh_slots().await?;
+        connection.slots = slots;
+        connection.connections = connections;
+        Ok(connection)
     }
 
-    fn create_initial_connections(
-        initial_nodes: &Vec<ConnectionInfo>,
-    ) -> impl ImplRedisFuture<HashMap<String, C>> {
-        let connections = HashMap::with_capacity(initial_nodes.len());
-
-        stream::iter_ok(initial_nodes.clone())
-            .and_then(|info| {
+    async fn create_initial_connections(
+        initial_nodes: &[ConnectionInfo],
+    ) -> RedisResult<HashMap<String, C>> {
+        stream::iter(initial_nodes)
+            .then(|info| {
                 let addr = match *info.addr {
                     ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
                     _ => panic!("No reach."),
                 };
 
-                connect_and_check(info.clone()).then(|result| {
-                    Ok(match result {
-                        Ok(conn) => Some((addr, conn)),
-                        Err(_) => None,
-                    })
+                connect_and_check(info.clone()).map(|result| match result {
+                    Ok(conn) => Some((addr, conn)),
+                    Err(_) => None,
                 })
             })
-            .fold(connections, |mut connections, conn| -> RedisResult<_> {
-                connections.extend(conn);
-                Ok(connections)
-            })
-            .and_then(|connections| {
+            .fold(
+                HashMap::with_capacity(initial_nodes.len()),
+                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| {
+                    async move {
+                        connections.extend(conn);
+                        connections
+                    }
+                },
+            )
+            .map(|connections| {
                 if connections.len() == 0 {
                     return Err(RedisError::from((
                         ErrorKind::IoError,
@@ -375,86 +400,65 @@ where
                 }
                 Ok(connections)
             })
+            .await
     }
 
     // Query a node to discover slot-> master mappings.
-    fn refresh_slots(&mut self) -> impl ImplRedisFuture<(SlotMap, HashMap<String, C>)> {
-        let slots_future = {
-            let samples = self.connections.values().cloned().collect::<Vec<_>>();
-
-            let mut found_slots = false;
-            stream::iter_ok(samples)
-                .and_then(|conn| get_slots(conn).and_then(Self::build_slot_map).then(Ok))
-                // Query connections until we find one that
-                .take_while(move |result: &RedisResult<_>| {
-                    let take_this = !found_slots;
-                    found_slots = result.is_ok();
-                    future::ok(take_this)
-                })
-                // Get the last result which is either Ok or all nodes failed to return slots
-                // to us
-                .fold(None, |_, result| Ok::<_, RedisError>(Some(result)))
-                .and_then(move |opt| {
-                    opt.ok_or_else(|| {
-                        RedisError::from((
-                            ErrorKind::IoError,
-                            "No connections to refresh slots from",
-                        ))
-                    })?
-                })
-        };
-
+    fn refresh_slots(
+        &mut self,
+    ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
-        // Remove dead connections and connect to new nodes if necessary
-        let new_connections = HashMap::with_capacity(connections.len());
+        async move {
+            let mut result = Ok(SlotMap::new());
+            for conn in connections.values_mut() {
+                match get_slots(&mut *conn)
+                    .await
+                    .and_then(|v| Self::build_slot_map(v))
+                {
+                    Ok(s) => {
+                        result = Ok(s);
+                        break;
+                    }
+                    Err(err) => result = Err(err),
+                }
+            }
+            let slots = result?;
 
-        slots_future.and_then(|slots| {
-            stream::iter_ok(slots.values().cloned().collect::<Vec<_>>())
-                .fold(new_connections, move |mut new_connections, addr| {
-                    if !new_connections.contains_key(&addr) {
-                        let mut new_connection_future =
-                            if let Some(conn) = connections.remove(&addr) {
-                                future::Either::A(
-                                    check_connection(conn)
-                                        .map({
-                                            let addr = addr.clone();
-                                            move |conn| Some((addr.to_string(), conn))
-                                        })
-                                        .or_else(move |_| {
-                                            connect_and_check(addr.as_ref())
-                                                .then(move |result| {
-                                                    Ok(match result {
-                                                        Ok(conn) => Some((addr.to_string(), conn)),
-                                                        Err(_) => None,
-                                                    })
-                                                })
-                                                .map_err(|err: RedisError| err)
-                                        }),
-                                )
-                            } else {
-                                future::Either::B(connect_and_check(addr.as_ref()).then(
-                                    move |result| {
-                                        Ok(match result {
+            // Remove dead connections and connect to new nodes if necessary
+            let new_connections = HashMap::with_capacity(connections.len());
+
+            let (_, connections) = stream::iter(slots.values())
+                .fold(
+                    (connections, new_connections),
+                    move |(mut connections, mut new_connections), addr| {
+                        async move {
+                            if !new_connections.contains_key(addr) {
+                                let new_connection = if let Some(mut conn) =
+                                    connections.remove(addr)
+                                {
+                                    match check_connection(&mut conn).await {
+                                        Ok(_) => Some((addr.to_string(), conn)),
+                                        Err(_) => match connect_and_check(addr.as_ref()).await {
                                             Ok(conn) => Some((addr.to_string(), conn)),
                                             Err(_) => None,
-                                        })
-                                    },
-                                ))
-                            };
-                        future::Either::A(future::poll_fn(move || {
-                            let new_connection = try_ready!(new_connection_future.poll());
-                            new_connections.extend(new_connection);
-                            Ok(mem::replace(&mut new_connections, Default::default()).into())
-                        }))
-                    } else {
-                        future::Either::B(
-                            future::ok(new_connections).map_err(|err: RedisError| err),
-                        )
-                    }
-                })
-                .map(|connections| (slots, connections))
-        })
+                                        },
+                                    }
+                                } else {
+                                    match connect_and_check(addr.as_ref()).await {
+                                        Ok(conn) => Some((addr.to_string(), conn)),
+                                        Err(_) => None,
+                                    }
+                                };
+                                new_connections.extend(new_connection);
+                            }
+                            (connections, new_connections)
+                        }
+                    },
+                )
+                .await;
+            Ok((slots, connections))
+        }
     }
 
     fn build_slot_map(mut slots_data: Vec<Slot>) -> RedisResult<SlotMap> {
@@ -488,10 +492,10 @@ where
         Ok(slot_map)
     }
 
-    fn get_connection(&self, slot: u16) -> impl Future<Item = (String, C), Error = Void> + 'static {
+    fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
         if let Some((_, addr)) = self.slots.range(&slot..).next() {
             if self.connections.contains_key(addr) {
-                return future::Either::A(future::ok((
+                return future::Either::Left(future::ready((
                     addr.clone(),
                     self.connections.get(addr).unwrap().clone(),
                 )));
@@ -501,57 +505,58 @@ where
             //
             let random_conn = get_random_connection(&self.connections, None); // TODO Only do this lookup if the first check fails
             let addr = addr.clone();
-            future::Either::B(
-                connect_and_check(addr.as_ref())
+            future::Either::Right(async move {
+                let result = connect_and_check(addr.as_ref()).await;
+                result
                     .map(|conn| (addr, conn))
-                    .or_else(|_| future::ok(random_conn)),
-            )
+                    .unwrap_or_else(|_| random_conn)
+            })
         } else {
             // Return a random connection
-            future::Either::A(future::ok(get_random_connection(&self.connections, None)))
+            future::Either::Left(future::ready(get_random_connection(
+                &self.connections,
+                None,
+            )))
         }
     }
 
     fn try_request(
         &self,
         info: &RequestInfo<C>,
-    ) -> impl Future<Item = (String, RedisResult<Response>), Error = Void> {
+    ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
         let cmd = info.cmd.clone();
-        let func = info.func;
         (if info.excludes.len() > 0 || info.slot.is_none() {
-            future::Either::A(future::ok(get_random_connection(
+            future::Either::Left(future::ready(get_random_connection(
                 &self.connections,
                 Some(&info.excludes),
             )))
         } else {
-            future::Either::B(self.get_connection(info.slot.unwrap()))
+            future::Either::Right(self.get_connection(info.slot.unwrap()))
         })
-        .and_then(move |(addr, conn)| {
-            func(conn, cmd)
-                .map(|(_, value)| value)
-                .then(|result| Ok((addr, result)))
-        })
+        .then(move |(addr, conn)| cmd.exec(conn).map(|result| (addr, result)))
     }
 }
 
-impl<C> Sink for Pipeline<C>
+impl<C> Sink<Message<C>> for Pipeline<C>
 where
-    C: ConnectionLike + Connect + Clone + Send + 'static,
+    C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
 {
-    type SinkItem = Message<C>;
-    type SinkError = ();
+    type Error = ();
 
-    fn start_send(&mut self, msg: Message<C>) -> StartSend<Message<C>, Self::SinkError> {
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+        Ok(()).into()
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
         trace!("start_send");
         let cmd = msg.cmd;
 
         let excludes = HashSet::new();
-        let slot = slot_for_packed_command(&cmd.cmd);
+        let slot = cmd.slot();
 
         let info = RequestInfo {
             cmd,
-            func: msg.func,
             slot,
             excludes,
         };
@@ -563,26 +568,31 @@ where
             info,
         };
         self.in_flight_requests.push(request);
-        Ok(AsyncSink::Ready)
+        Ok(()).into()
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_complete: {:?}", self.state);
         loop {
             self.state = match mem::replace(&mut self.state, ConnectionState::PollComplete) {
-                ConnectionState::Recover(mut future) => match future.poll() {
-                    Ok(Async::Ready((slots, connections))) => {
+                ConnectionState::Recover(mut future) => match future.as_mut().poll(cx) {
+                    Poll::Ready(Ok((slots, connections))) => {
                         trace!("Recovered with {} connections!", connections.len());
                         self.slots = slots;
                         self.connections = connections;
                         ConnectionState::PollComplete
                     }
-                    Ok(Async::NotReady) => {
+                    Poll::Pending => {
                         self.state = ConnectionState::Recover(future);
                         trace!("Recover not ready");
-                        return Ok(Async::NotReady);
+                        return Poll::Pending;
                     }
-                    Err(_err) => ConnectionState::Recover(Box::new(self.refresh_slots())),
+                    Poll::Ready(Err(_err)) => {
+                        ConnectionState::Recover(Box::pin(self.refresh_slots()))
+                    }
                 },
                 ConnectionState::PollComplete => {
                     let mut error = None;
@@ -592,71 +602,75 @@ where
                         if let RequestState::None = self.in_flight_requests[i].future {
                             let future = self.try_request(&self.in_flight_requests[i].info);
                             self.in_flight_requests[i].future =
-                                RequestState::Future(Box::new(future));
+                                RequestState::Future(Box::pin(future));
                         }
 
-                        match self.in_flight_requests[i].poll_request(self.connections.len()) {
-                            Ok(Async::NotReady) => {
+                        let self_ = &mut *self;
+                        match self_.in_flight_requests[i].poll_request(cx, self_.connections.len())
+                        {
+                            Poll::Pending => {
                                 i += 1;
                             }
-                            Ok(Async::Ready(next)) => match next {
-                                Next::Done => {
-                                    self.in_flight_requests.swap_remove(i);
-                                }
-                                Next::TryNewConnection => {
-                                    let mut request = self.in_flight_requests.swap_remove(i);
-                                    request.future = RequestState::Future(Box::new(
-                                        self.try_request(&request.info),
-                                    ));
-                                    self.in_flight_requests.push(request);
+                            Poll::Ready(result) => match result {
+                                Ok(next) => match next {
+                                    Next::Done => {
+                                        self.in_flight_requests.swap_remove(i);
+                                    }
+                                    Next::TryNewConnection => {
+                                        let mut request = self.in_flight_requests.swap_remove(i);
+                                        request.future = RequestState::Future(Box::pin(
+                                            self.try_request(&request.info),
+                                        ));
+                                        self.in_flight_requests.push(request);
+                                    }
+                                },
+                                Err(err) => {
+                                    error = Some(err);
+
+                                    self.in_flight_requests[i].future = RequestState::None;
+                                    i += 1;
                                 }
                             },
-                            Err(err) => {
-                                error = Some(err);
-
-                                self.in_flight_requests[i].future = RequestState::None;
-                                i += 1;
-                            }
                         }
                     }
 
                     if let Some(err) = error {
                         trace!("Recovering {}", err);
-                        ConnectionState::Recover(Box::new(self.refresh_slots()))
+                        ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     } else if self.in_flight_requests.is_empty() {
-                        return Ok(Async::Ready(()));
+                        return Ok(()).into();
                     } else {
-                        return Ok(Async::NotReady);
+                        return Poll::Pending;
                     }
                 }
             }
         }
     }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
+    }
 }
 
 impl<C> ConnectionLike for Connection<C>
 where
-    C: ConnectionLike + 'static,
+    C: ConnectionLike + Send + 'static,
 {
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         trace!("req_packed_command");
         let (sender, receiver) = oneshot::channel();
-        Box::new(
+        Box::pin(async move {
             self.0
-                .clone()
                 .send(Message {
-                    cmd: CmdArg {
-                        cmd,
-                        offset: 0,
-                        count: 0,
+                    cmd: CmdArg::Cmd {
+                        cmd: Arc::new(cmd.clone()), // TODO Remove this clone?
+                        func: |mut conn, cmd| {
+                            Box::pin(async move {
+                                conn.req_packed_command(&cmd).map_ok(Response::Single).await
+                            })
+                        },
                     },
                     sender,
-                    func: |conn, cmd| {
-                        Box::new(
-                            conn.req_packed_command(cmd.cmd)
-                                .map(|(conn, value)| (conn, Response::Single(value))),
-                        )
-                    },
                 })
                 .map_err(|_| {
                     RedisError::from(io::Error::new(
@@ -664,68 +678,59 @@ where
                         "redis_cluster: Unable to send command",
                     ))
                 })
-                .and_then(move |_| {
-                    receiver.then(|result| {
-                        result
-                            .unwrap_or_else(|_| {
-                                Err(RedisError::from(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "redis_cluster: Unable to receive command",
-                                )))
-                            })
-                            .map(|response| {
-                                (
-                                    self,
-                                    match response {
-                                        Response::Single(value) => value,
-                                        Response::Multiple(_) => unreachable!(),
-                                    },
-                                )
-                            })
-                    })
-                }),
-        )
+                .await?;
+            receiver
+                .await
+                .unwrap_or_else(|_| {
+                    Err(RedisError::from(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "redis_cluster: Unable to receive command",
+                    )))
+                })
+                .map(|response| match response {
+                    Response::Single(value) => value,
+                    Response::Multiple(_) => unreachable!(),
+                })
+        })
     }
 
-    fn req_packed_commands(
-        self,
-        cmd: Vec<u8>,
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
         offset: usize,
         count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
+    ) -> RedisFuture<'a, Vec<Value>> {
         let (sender, receiver) = oneshot::channel();
-        Box::new(
+        Box::pin(async move {
             self.0
-                .clone()
                 .send(Message {
-                    cmd: CmdArg { cmd, offset, count },
-                    sender,
-                    func: |conn, cmd| {
-                        Box::new(
-                            conn.req_packed_commands(cmd.cmd, cmd.offset, cmd.count)
-                                .map(|(conn, values)| (conn, Response::Multiple(values))),
-                        )
+                    cmd: CmdArg::Pipeline {
+                        pipeline: Arc::new(pipeline.clone()), // TODO Remove this clone?
+                        offset,
+                        count,
+                        func: |mut conn, pipeline, offset, count| {
+                            Box::pin(async move {
+                                conn.req_packed_commands(&pipeline, offset, count)
+                                    .map_ok(Response::Multiple)
+                                    .await
+                            })
+                        },
                     },
+                    sender,
                 })
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-                .and_then(move |_| {
-                    receiver.then(|result| {
-                        result
-                            .unwrap_or_else(|_| {
-                                Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-                            })
-                            .map(|response| {
-                                (
-                                    self,
-                                    match response {
-                                        Response::Multiple(values) => values,
-                                        Response::Single(_) => unreachable!(),
-                                    },
-                                )
-                            })
-                    })
-                }),
-        )
+                .await?;
+
+            receiver
+                .await
+                .unwrap_or_else(|_| {
+                    Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                })
+                .map(|response| match response {
+                    Response::Multiple(values) => values,
+                    Response::Single(_) => unreachable!(),
+                })
+        })
     }
 
     fn get_db(&self) -> i64 {
@@ -739,62 +744,50 @@ impl Clone for Client {
     }
 }
 
-macro_rules! try_future {
-    ($e:expr) => {
-        try_future!($e, $crate::box_future)
-    };
-    ($e:expr, $f:expr) => {
-        match $e {
-            Ok(x) => x,
-            Err(err) => return $f(::futures::future::err(err.into())),
-        }
-    };
-}
+trait ImplRedisFuture<T>: Future<Output = RedisResult<T>> {}
+impl<T, F> ImplRedisFuture<T> for F where F: Future<Output = RedisResult<T>> {}
 
-pub(crate) fn box_future<'a, F>(
-    f: F,
-) -> Box<dyn Future<Item = F::Item, Error = F::Error> + Send + 'a>
-where
-    F: Future + Send + 'a,
-{
-    Box::new(f)
-}
-
-trait ImplRedisFuture<T>: Future<Item = T, Error = RedisError> {}
-impl<T, F> ImplRedisFuture<T> for F where F: Future<Item = T, Error = RedisError> {}
-
-pub trait Connect {
-    fn connect<T>(info: T) -> RedisFuture<Self>
+pub trait Connect: Sized {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
     where
-        T: IntoConnectionInfo;
+        T: IntoConnectionInfo + Send + 'a;
 }
 
-impl Connect for redis::aio::SharedConnection {
-    fn connect<T>(info: T) -> RedisFuture<redis::aio::SharedConnection>
+impl Connect for redis::aio::MultiplexedConnection {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, redis::aio::MultiplexedConnection>
     where
-        T: IntoConnectionInfo,
+        T: IntoConnectionInfo + Send + 'a,
     {
-        let connection_info = try_future!(info.into_connection_info());
-        let client = try_future!(redis::Client::open(connection_info));
-        Box::new(client.get_shared_async_connection())
+        async move {
+            let connection_info = info.into_connection_info()?;
+            let client = redis::Client::open(connection_info)?;
+            client.get_multiplexed_tokio_connection().await
+        }
+            .boxed()
     }
 }
 
-fn connect_and_check<T, C>(info: T) -> RedisFuture<C>
+fn connect_and_check<'a, T, C>(info: T) -> impl ImplRedisFuture<C> + 'a
 where
-    T: IntoConnectionInfo,
+    T: IntoConnectionInfo + Send + 'a,
     C: ConnectionLike + Connect + Send + 'static,
 {
-    Box::new(C::connect(info).and_then(|conn| check_connection(conn)))
+    C::connect(info).and_then(|mut conn| {
+        async move {
+            check_connection(&mut conn).await?;
+            Ok(conn)
+        }
+    })
 }
 
-fn check_connection<C>(conn: C) -> impl ImplRedisFuture<C>
+async fn check_connection<C>(conn: &mut C) -> RedisResult<()>
 where
     C: ConnectionLike + Send + 'static,
 {
     let mut cmd = Cmd::new();
     cmd.arg("PING");
-    cmd.query_async::<_, String>(conn).map(|(conn, _)| conn)
+    cmd.query_async::<_, String>(conn).await?;
+    Ok(())
 }
 
 fn get_random_connection<'a, C>(
@@ -819,30 +812,9 @@ where
     (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 
-fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
-    command_key(cmd).map(|key| {
-        let key = sub_key(&key);
-        State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
-    })
-}
-
-fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
-    // TODO Avoid parsing the entire request to a `redis::Value`
-    redis::parse_redis_value(cmd)
-        .ok()
-        .and_then(|value| match value {
-            Value::Bulk(mut args) => {
-                if args.len() >= 2 {
-                    match args.swap_remove(1) {
-                        Value::Data(key) => Some(key),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
+fn slot_for_key(key: &[u8]) -> u16 {
+    let key = sub_key(&key);
+    State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
 }
 
 // If a key contains `{` and `}`, everything between the first occurence is the only thing that
@@ -891,92 +863,115 @@ impl Slot {
 }
 
 // Get slot data from connection.
-fn get_slots<C>(connection: C) -> impl Future<Item = Vec<Slot>, Error = RedisError>
+async fn get_slots<C>(connection: &mut C) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
     trace!("get_slots");
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
-    let packed_command = cmd.get_packed_command();
-    connection
-        .req_packed_command(packed_command)
+    let value = connection
+        .req_packed_command(&cmd)
         .map_err(|err| {
             trace!("get_slots error: {}", err);
             err
         })
-        .and_then(|(_connection, value)| {
-            trace!("get_slots -> {:#?}", value);
-            // Parse response.
-            let mut result = Vec::with_capacity(2);
+        .await?;
+    trace!("get_slots -> {:#?}", value);
+    // Parse response.
+    let mut result = Vec::with_capacity(2);
 
-            if let Value::Bulk(items) = value {
-                let mut iter = items.into_iter();
-                while let Some(Value::Bulk(item)) = iter.next() {
-                    if item.len() < 3 {
-                        continue;
-                    }
-
-                    let start = if let Value::Int(start) = item[0] {
-                        start as u16
-                    } else {
-                        continue;
-                    };
-
-                    let end = if let Value::Int(end) = item[1] {
-                        end as u16
-                    } else {
-                        continue;
-                    };
-
-                    let mut nodes: Vec<String> = item
-                        .into_iter()
-                        .skip(2)
-                        .filter_map(|node| {
-                            if let Value::Bulk(node) = node {
-                                if node.len() < 2 {
-                                    return None;
-                                }
-
-                                let ip = if let Value::Data(ref ip) = node[0] {
-                                    String::from_utf8_lossy(ip)
-                                } else {
-                                    return None;
-                                };
-
-                                let port = if let Value::Int(port) = node[1] {
-                                    port
-                                } else {
-                                    return None;
-                                };
-                                Some(format!("redis://{}:{}", ip, port))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    if nodes.len() < 1 {
-                        continue;
-                    }
-
-                    let replicas = nodes.split_off(1);
-                    result.push(Slot {
-                        start,
-                        end,
-                        master: nodes.pop().unwrap(),
-                        replicas,
-                    });
-                }
+    if let Value::Bulk(items) = value {
+        let mut iter = items.into_iter();
+        while let Some(Value::Bulk(item)) = iter.next() {
+            if item.len() < 3 {
+                continue;
             }
 
-            Ok(result)
-        })
+            let start = if let Value::Int(start) = item[0] {
+                start as u16
+            } else {
+                continue;
+            };
+
+            let end = if let Value::Int(end) = item[1] {
+                end as u16
+            } else {
+                continue;
+            };
+
+            let mut nodes: Vec<String> = item
+                .into_iter()
+                .skip(2)
+                .filter_map(|node| {
+                    if let Value::Bulk(node) = node {
+                        if node.len() < 2 {
+                            return None;
+                        }
+
+                        let ip = if let Value::Data(ref ip) = node[0] {
+                            String::from_utf8_lossy(ip)
+                        } else {
+                            return None;
+                        };
+
+                        let port = if let Value::Int(port) = node[1] {
+                            port
+                        } else {
+                            return None;
+                        };
+                        Some(format!("redis://{}:{}", ip, port))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if nodes.len() < 1 {
+                continue;
+            }
+
+            let replicas = nodes.split_off(1);
+            result.push(Slot {
+                start,
+                end,
+                master: nodes.pop().unwrap(),
+                replicas,
+            });
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
+        command_key(cmd).map(|key| {
+            let key = sub_key(&key);
+            State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
+        })
+    }
+
+    fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
+        redis::parse_redis_value(cmd)
+            .ok()
+            .and_then(|value| match value {
+                Value::Bulk(mut args) => {
+                    if args.len() >= 2 {
+                        match args.swap_remove(1) {
+                            Value::Data(key) => Some(key),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+    }
 
     #[test]
     fn slot() {
