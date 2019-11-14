@@ -394,7 +394,14 @@ where
                 // Get the last result which is either Ok or all nodes failed to return slots
                 // to us
                 .fold(None, |_, result| Ok::<_, RedisError>(Some(result)))
-                .and_then(move |opt| opt.expect("No connections to refresh slots from"))
+                .and_then(move |opt| {
+                    opt.ok_or_else(|| {
+                        RedisError::from((
+                            ErrorKind::IoError,
+                            "No connections to refresh slots from",
+                        ))
+                    })?
+                })
         };
 
         let mut connections = mem::replace(&mut self.connections, Default::default());
