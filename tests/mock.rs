@@ -166,7 +166,7 @@ fn tryagain_simple() {
                 .arg("test")
                 .query_async::<_, Option<i32>>(connection),
         )
-        .map(|(_, x)| x);;
+        .map(|(_, x)| x);
 
     assert_eq!(value, Ok(Some(123)));
 }
@@ -277,7 +277,7 @@ fn rebuild_with_extra_nodes() {
                 .arg("test")
                 .query_async::<_, Option<i32>>(connection),
         )
-        .map(|(_, x)| x);;
+        .map(|(_, x)| x);
 
     assert_eq!(value, Ok(Some(123)));
 }
