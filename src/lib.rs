@@ -27,7 +27,7 @@
 //!
 //! # Pipelining
 //! ```rust
-//! use redis_cluster_async::{Client, redis::{PipelineCommands, pipe}};
+//! use redis_cluster_async::{Client, redis::pipe};
 //!
 //! #[tokio::main]
 //! async fn main() -> redis::RedisResult<()> {
@@ -384,11 +384,9 @@ where
             })
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
-                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| {
-                    async move {
-                        connections.extend(conn);
-                        connections
-                    }
+                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| async move {
+                    connections.extend(conn);
+                    connections
                 },
             )
             .map(|connections| {
@@ -431,29 +429,25 @@ where
             let (_, connections) = stream::iter(slots.values())
                 .fold(
                     (connections, new_connections),
-                    move |(mut connections, mut new_connections), addr| {
-                        async move {
-                            if !new_connections.contains_key(addr) {
-                                let new_connection = if let Some(mut conn) =
-                                    connections.remove(addr)
-                                {
-                                    match check_connection(&mut conn).await {
-                                        Ok(_) => Some((addr.to_string(), conn)),
-                                        Err(_) => match connect_and_check(addr.as_ref()).await {
-                                            Ok(conn) => Some((addr.to_string(), conn)),
-                                            Err(_) => None,
-                                        },
-                                    }
-                                } else {
-                                    match connect_and_check(addr.as_ref()).await {
+                    move |(mut connections, mut new_connections), addr| async move {
+                        if !new_connections.contains_key(addr) {
+                            let new_connection = if let Some(mut conn) = connections.remove(addr) {
+                                match check_connection(&mut conn).await {
+                                    Ok(_) => Some((addr.to_string(), conn)),
+                                    Err(_) => match connect_and_check(addr.as_ref()).await {
                                         Ok(conn) => Some((addr.to_string(), conn)),
                                         Err(_) => None,
-                                    }
-                                };
-                                new_connections.extend(new_connection);
-                            }
-                            (connections, new_connections)
+                                    },
+                                }
+                            } else {
+                                match connect_and_check(addr.as_ref()).await {
+                                    Ok(conn) => Some((addr.to_string(), conn)),
+                                    Err(_) => None,
+                                }
+                            };
+                            new_connections.extend(new_connection);
                         }
+                        (connections, new_connections)
                     },
                 )
                 .await;
@@ -763,7 +757,7 @@ impl Connect for redis::aio::MultiplexedConnection {
             let client = redis::Client::open(connection_info)?;
             client.get_multiplexed_tokio_connection().await
         }
-            .boxed()
+        .boxed()
     }
 }
 
@@ -772,11 +766,9 @@ where
     T: IntoConnectionInfo + Send + 'a,
     C: ConnectionLike + Connect + Send + 'static,
 {
-    C::connect(info).and_then(|mut conn| {
-        async move {
-            check_connection(&mut conn).await?;
-            Ok(conn)
-        }
+    C::connect(info).and_then(|mut conn| async move {
+        check_connection(&mut conn).await?;
+        Ok(conn)
     })
 }
 
