@@ -1,0 +1,31 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches:
+    - master
+jobs:
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+        - build: stable
+          os: ubuntu-18.04
+          rust: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v1
+      with:
+        fetch-depth: 1
+    - name: Install Rust
+      uses: hecrj/setup-rust-action@v1
+      with:
+        rust-version: ${{ matrix.rust }}
+    - run: cargo build --verbose
+    - run: cargo doc --verbose
+    - name: Run benchmarks as tests
+      run:
+        - ./start_cluster.sh &
+        - cargo test --verbose
