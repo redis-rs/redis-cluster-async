@@ -197,11 +197,35 @@ impl<C> CmdArg<C> {
     }
 
     fn slot(&self) -> Option<u16> {
-        fn slot_for_command(cmd: &Cmd) -> Option<u16> {
-            cmd.args_iter().nth(1).and_then(|arg| match arg {
-                redis::Arg::Simple(key) => Some(slot_for_key(key)),
-                redis::Arg::Cursor => None, // FIXME ???
+        fn get_cmd_arg<'a>(cmd: &'a Cmd, arg_num: usize) -> Option<&'a [u8]> {
+            cmd.args_iter().nth(arg_num).and_then(|arg| match arg {
+                redis::Arg::Simple(arg) => Some(arg),
+                redis::Arg::Cursor => None,
             })
+        }
+        fn slot_for_command(cmd: &Cmd) -> Option<u16> {
+            match get_cmd_arg(cmd, 0) {
+                Some(b"EVAL") | Some(b"EVALSHA") => {
+                    get_cmd_arg(cmd, 2).and_then(|key_count_bytes| {
+                        let key_count_res = std::str::from_utf8(key_count_bytes)
+                            .ok()
+                            .and_then(|key_count_str| key_count_str.parse::<usize>().ok());
+                        key_count_res.and_then(|key_count| {
+                            if key_count > 0 {
+                                get_cmd_arg(cmd, 3).map(|key| slot_for_key(key))
+                            } else {
+                                // TODO need to handle sending to all masters
+                                None
+                            }
+                        })
+                    })
+                }
+                Some(b"SCRIPT") => {
+                    // TODO need to handle sending to all masters
+                    None
+                }
+                _ => get_cmd_arg(cmd, 1).map(|key| slot_for_key(key)),
+            }
         }
         match self {
             Self::Cmd { cmd, .. } => slot_for_command(cmd),
