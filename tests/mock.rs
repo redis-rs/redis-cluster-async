@@ -209,7 +209,7 @@ fn tryagain_exhaust_retries() {
 
     assert_eq!(
         result.map_err(|err| err.to_string()),
-        Err("TRYAGAIN: mock".to_string())
+        Err("An error was signalled by the server: mock".to_string())
     );
     assert_eq!(requests.load(atomic::Ordering::SeqCst), 3);
 }

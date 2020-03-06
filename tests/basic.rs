@@ -11,7 +11,7 @@ use {
 };
 
 use redis_cluster_async::{
-    redis::{cmd, RedisError, RedisResult},
+    redis::{cmd, RedisError, RedisResult, Script},
     Client,
 };
 
@@ -160,6 +160,49 @@ fn basic_cmd() {
                 .query_async(&mut connection)
                 .await?;
             assert_eq!(res, "test_data");
+            Ok(())
+        })
+        .map_err(|err: RedisError| err)
+        .unwrap()
+}
+
+#[test]
+fn basic_eval() {
+    let mut env = RedisEnv::new();
+    let client = env.client;
+    env.runtime
+        .block_on(async {
+            let mut connection = client.get_connection().await?;
+            let res: String = cmd("EVAL")
+                .arg(r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#)
+                .arg(1)
+                .arg("key")
+                .arg("test")
+                .query_async(&mut connection)
+                .await?;
+            assert_eq!(res, "test");
+            Ok(())
+        })
+        .map_err(|err: RedisError| err)
+        .unwrap()
+}
+
+#[ignore] // TODO Handle running SCRIPT LOAD on all masters
+#[test]
+fn basic_script() {
+    let mut env = RedisEnv::new();
+    let client = env.client;
+    env.runtime
+        .block_on(async {
+            let mut connection = client.get_connection().await?;
+            let res: String = Script::new(
+                r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#,
+            )
+            .key("key")
+            .arg("test")
+            .invoke_async(&mut connection)
+            .await?;
+            assert_eq!(res, "test");
             Ok(())
         })
         .map_err(|err: RedisError| err)

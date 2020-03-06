@@ -699,9 +699,9 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "0.14.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d69c054daeca01bc1bee4af75b04dffa3458d6702cb7a74c2f38518c130fb624"
+checksum = "3eeb1fe3fc011cde97315f370bc88e4db3c23b08709a04915921e02b1d363b20"
 dependencies = [
  "bytes",
  "combine",
