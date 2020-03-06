@@ -197,7 +197,7 @@ impl<C> CmdArg<C> {
     }
 
     fn slot(&self) -> Option<u16> {
-        fn get_cmd_arg<'a>(cmd: &'a Cmd, arg_num: usize) -> Option<&'a [u8]> {
+        fn get_cmd_arg(cmd: &Cmd, arg_num: usize) -> Option<&[u8]> {
             cmd.args_iter().nth(arg_num).and_then(|arg| match arg {
                 redis::Arg::Simple(arg) => Some(arg),
                 redis::Arg::Cursor => None,
