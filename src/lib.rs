@@ -397,7 +397,10 @@ where
         stream::iter(initial_nodes)
             .then(|info| {
                 let addr = match *info.addr {
-                    ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
+                    ConnectionAddr::Tcp(ref host, port) => match &info.passwd {
+                        Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
+                        None => format!("redis://{}:{}", host, port),
+                    },
                     _ => panic!("No reach."),
                 };
 
@@ -433,8 +436,8 @@ where
 
         async move {
             let mut result = Ok(SlotMap::new());
-            for conn in connections.values_mut() {
-                match get_slots(&mut *conn)
+            for (addr, conn) in connections.iter_mut() {
+                match get_slots(addr, &mut *conn)
                     .await
                     .and_then(|v| Self::build_slot_map(v))
                 {
@@ -879,7 +882,7 @@ impl Slot {
 }
 
 // Get slot data from connection.
-async fn get_slots<C>(connection: &mut C) -> RedisResult<Vec<Slot>>
+async fn get_slots<C>(addr: &str, connection: &mut C) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
@@ -898,6 +901,7 @@ where
     let mut result = Vec::with_capacity(2);
 
     if let Value::Bulk(items) = value {
+        let password = get_password(addr);
         let mut iter = items.into_iter();
         while let Some(Value::Bulk(item)) = iter.next() {
             if item.len() < 3 {
@@ -936,7 +940,10 @@ where
                         } else {
                             return None;
                         };
-                        Some(format!("redis://{}:{}", ip, port))
+                        match &password {
+                            Some(pw) => Some(format!("redis://:{}@{}:{}", pw, ip, port)),
+                            None => Some(format!("redis://{}:{}", ip, port)),
+                        }
                     } else {
                         None
                     }
@@ -958,6 +965,12 @@ where
     }
 
     Ok(result)
+}
+
+fn get_password(addr: &str) -> Option<String> {
+    redis::parse_redis_url(addr)
+        .ok()
+        .and_then(|url| url.password().map(|s| s.into()))
 }
 
 #[cfg(test)]
