@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "redis_cluster_async"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc16",
  "env_logger",
