@@ -15,12 +15,12 @@ edition = "2018"
 crc16 = "0.4"
 futures = "0.3"
 rand = "0.7"
-redis = { version = "0.15", features = ["tokio-rt-core"] }
+redis = { version = "0.17", features = ["tokio-rt-core"] }
 tokio = { version = "0.2", features = ["time"] }
 log = "0.4"
 
 [dev-dependencies]
 lazy_static = "1"
 tokio = { version = "0.2", features = ["macros", "full"] }
-env_logger = "0.7"
-proptest = "0.9"
+env_logger = "0.8"
+proptest = "0.10"
