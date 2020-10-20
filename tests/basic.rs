@@ -11,7 +11,7 @@ use {
 };
 
 use redis_cluster_async::{
-    redis::{cmd, RedisError, RedisResult, Script},
+    redis::{cmd, AsyncCommands, RedisError, RedisResult, Script},
     Client,
 };
 
@@ -37,73 +37,79 @@ impl RedisProcess {
 
 // ----------------------------------------------------------------------------
 
-pub struct RedisEnv {
-    _redis_lock: RedisLock,
+pub struct RuntimeEnv {
+    pub redis: RedisEnv,
     pub runtime: Runtime,
-    pub client: Client,
-    nodes: Vec<redis::aio::MultiplexedConnection>,
 }
 
-impl RedisEnv {
+impl RuntimeEnv {
     pub fn new() -> Self {
-        let _ = env_logger::try_init();
-
         let mut runtime = tokio::runtime::Builder::new()
             .basic_scheduler()
             .enable_io()
             .enable_time()
             .build()
             .unwrap();
+        let redis = runtime.block_on(RedisEnv::new());
+        Self { runtime, redis }
+    }
+}
+pub struct RedisEnv {
+    _redis_lock: RedisLock,
+    pub client: Client,
+    nodes: Vec<redis::aio::MultiplexedConnection>,
+}
+
+impl RedisEnv {
+    pub async fn new() -> Self {
+        let _ = env_logger::try_init();
+
         let redis_lock = RedisProcess::lock();
 
         let redis_client = redis::Client::open(REDIS_URL)
             .unwrap_or_else(|_| panic!("Failed to connect to '{}'", REDIS_URL));
 
-        let (client, nodes) = runtime.block_on(async {
-            let node_infos = loop {
-                let node_infos = async {
-                    let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
-                    Self::cluster_info(&mut conn).await
-                }
+        let node_infos = loop {
+            let node_infos = async {
+                let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
+                Self::cluster_info(&mut conn).await
+            }
+            .await
+            .expect("Unable to query nodes for information");
+            // Wait for the cluster to stabilize
+            if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
+                break node_infos;
+            }
+            tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+        };
+        let mut node_urls = Vec::new();
+        let mut nodes = Vec::new();
+        // Clear databases:
+        for (url, master) in node_infos {
+            let redis_client = redis::Client::open(&url[..])
+                .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
+            let mut conn = redis_client
+                .get_multiplexed_tokio_connection()
                 .await
-                .expect("Unable to query nodes for information");
-                // Wait for the cluster to stabilize
-                if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
-                    break node_infos;
-                }
-                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
-            };
-            let mut node_urls = Vec::new();
-            let mut nodes = Vec::new();
-            // Clear databases:
-            for (url, master) in node_infos {
-                let redis_client = redis::Client::open(&url[..])
-                    .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
-                let mut conn = redis_client
-                    .get_multiplexed_tokio_connection()
-                    .await
-                    .unwrap();
+                .unwrap();
 
-                if master {
-                    node_urls.push(url.to_string());
-                    let () = tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        redis::Cmd::new().arg("FLUSHALL").query_async(&mut conn),
-                    )
-                    .await
-                    .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err))
-                    .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
-                }
-
-                nodes.push(conn);
+            if master {
+                node_urls.push(url.to_string());
+                let () = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    redis::Cmd::new().arg("FLUSHALL").query_async(&mut conn),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err))
+                .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
             }
 
-            let client = Client::open(node_urls.iter().map(|s| &s[..]).collect()).unwrap();
-            (client, nodes)
-        });
+            nodes.push(conn);
+        }
+
+        let client = Client::open(node_urls.iter().map(|s| &s[..]).collect()).unwrap();
 
         RedisEnv {
-            runtime,
             client,
             nodes,
             _redis_lock: redis_lock,
@@ -142,97 +148,93 @@ impl RedisEnv {
     }
 }
 
-#[test]
-fn basic_cmd() {
-    let mut env = RedisEnv::new();
+#[tokio::test]
+async fn basic_cmd() {
+    let env = RedisEnv::new().await;
     let client = env.client;
-    env.runtime
-        .block_on(async {
-            let mut connection = client.get_connection().await?;
-            let () = cmd("SET")
-                .arg("test")
-                .arg("test_data")
-                .query_async(&mut connection)
-                .await?;
-            let res: String = cmd("GET")
-                .arg("test")
-                .clone()
-                .query_async(&mut connection)
-                .await?;
-            assert_eq!(res, "test_data");
-            Ok(())
-        })
-        .map_err(|err: RedisError| err)
-        .unwrap()
+    async {
+        let mut connection = client.get_connection().await?;
+        let () = cmd("SET")
+            .arg("test")
+            .arg("test_data")
+            .query_async(&mut connection)
+            .await?;
+        let res: String = cmd("GET")
+            .arg("test")
+            .clone()
+            .query_async(&mut connection)
+            .await?;
+        assert_eq!(res, "test_data");
+        Ok(())
+    }
+    .await
+    .map_err(|err: RedisError| err)
+    .unwrap()
 }
 
-#[test]
-fn basic_eval() {
-    let mut env = RedisEnv::new();
+#[tokio::test]
+async fn basic_eval() {
+    let env = RedisEnv::new().await;
     let client = env.client;
-    env.runtime
-        .block_on(async {
-            let mut connection = client.get_connection().await?;
-            let res: String = cmd("EVAL")
-                .arg(r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#)
-                .arg(1)
-                .arg("key")
-                .arg("test")
-                .query_async(&mut connection)
-                .await?;
-            assert_eq!(res, "test");
-            Ok(())
-        })
-        .map_err(|err: RedisError| err)
-        .unwrap()
+    async {
+        let mut connection = client.get_connection().await?;
+        let res: String = cmd("EVAL")
+            .arg(r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#)
+            .arg(1)
+            .arg("key")
+            .arg("test")
+            .query_async(&mut connection)
+            .await?;
+        assert_eq!(res, "test");
+        Ok(())
+    }
+    .await
+    .map_err(|err: RedisError| err)
+    .unwrap()
 }
 
 #[ignore] // TODO Handle running SCRIPT LOAD on all masters
-#[test]
-fn basic_script() {
-    let mut env = RedisEnv::new();
+#[tokio::test]
+async fn basic_script() {
+    let env = RedisEnv::new().await;
     let client = env.client;
-    env.runtime
-        .block_on(async {
-            let mut connection = client.get_connection().await?;
-            let res: String = Script::new(
-                r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#,
-            )
-            .key("key")
-            .arg("test")
-            .invoke_async(&mut connection)
-            .await?;
-            assert_eq!(res, "test");
-            Ok(())
-        })
-        .map_err(|err: RedisError| err)
-        .unwrap()
+    async {
+        let mut connection = client.get_connection().await?;
+        let res: String = Script::new(
+            r#"redis.call("SET", KEYS[1], ARGV[1]); return redis.call("GET", KEYS[1])"#,
+        )
+        .key("key")
+        .arg("test")
+        .invoke_async(&mut connection)
+        .await?;
+        assert_eq!(res, "test");
+        Ok(())
+    }
+    .await
+    .map_err(|err: RedisError| err)
+    .unwrap()
 }
 
 #[ignore] // TODO Handle pipe where the keys do not all go to the same node
-#[test]
-fn basic_pipe() {
-    let mut env = RedisEnv::new();
+#[tokio::test]
+async fn basic_pipe() {
+    let env = RedisEnv::new().await;
     let client = env.client;
-    env.runtime
-        .block_on(async {
-            let mut connection = client.get_connection().await?;
-            let mut pipe = redis::pipe();
-            pipe.add_command(cmd("SET").arg("test").arg("test_data").clone());
-            pipe.add_command(cmd("SET").arg("test3").arg("test_data3").clone());
-            let () = pipe.query_async(&mut connection).await?;
-            let res: String = cmd("GET").arg("test").query_async(&mut connection).await?;
-            assert_eq!(res, "test_data");
-            let res: String = cmd("GET")
-                .arg("test3")
-                .clone()
-                .query_async(&mut connection)
-                .await?;
-            assert_eq!(res, "test_data3");
-            Ok(())
-        })
-        .map_err(|err: RedisError| err)
-        .unwrap()
+    async {
+        let mut connection = client.get_connection().await?;
+        let mut pipe = redis::pipe();
+        pipe.add_command(cmd("SET").arg("test").arg("test_data").clone());
+        pipe.add_command(cmd("SET").arg("test3").arg("test_data3").clone());
+        let () = pipe.query_async(&mut connection).await?;
+        let res: String = connection.get("test").await?;
+        assert_eq!(res, "test_data");
+        let res: String = connection.get("test3").await?;
+        assert_eq!(res, "test_data3");
+        Ok(())
+    }
+    .await
+    .map_err(|err: RedisError| err)
+    .unwrap()
 }
 
 #[test]
@@ -253,14 +255,17 @@ fn basic_failover() {
 }
 
 struct FailoverEnv {
-    env: RedisEnv,
+    env: RuntimeEnv,
     connection: redis_cluster_async::Connection,
 }
 
 impl FailoverEnv {
     fn new() -> Self {
-        let mut env = RedisEnv::new();
-        let connection = env.runtime.block_on(env.client.get_connection()).unwrap();
+        let mut env = RuntimeEnv::new();
+        let connection = env
+            .runtime
+            .block_on(env.redis.client.get_connection())
+            .unwrap();
 
         FailoverEnv { env, connection }
     }
@@ -282,7 +287,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
 
     let FailoverEnv { env, connection } = env;
 
-    let nodes = env.nodes.clone();
+    let nodes = env.redis.nodes.clone();
 
     let test_future = async {
         (0..requests + 1)
