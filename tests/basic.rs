@@ -60,6 +60,8 @@ pub struct RedisEnv {
     nodes: Vec<redis::aio::MultiplexedConnection>,
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 impl RedisEnv {
     pub async fn new() -> Self {
         let _ = env_logger::try_init();
@@ -69,7 +71,10 @@ impl RedisEnv {
         let redis_client = redis::Client::open(REDIS_URL)
             .unwrap_or_else(|_| panic!("Failed to connect to '{}'", REDIS_URL));
 
-        let node_infos = loop {
+        let mut master_urls = Vec::new();
+        let mut nodes = Vec::new();
+
+        'outer: loop {
             let node_infos = async {
                 let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
                 Self::cluster_info(&mut conn).await
@@ -78,36 +83,45 @@ impl RedisEnv {
             .expect("Unable to query nodes for information");
             // Wait for the cluster to stabilize
             if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
-                break node_infos;
+                let cleared_nodes = async {
+                    master_urls.clear();
+                    nodes.clear();
+                    // Clear databases:
+                    for (url, master) in node_infos {
+                        let redis_client = redis::Client::open(&url[..])
+                            .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
+                        let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
+
+                        if master {
+                            master_urls.push(url.to_string());
+                            let () = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                redis::Cmd::new()
+                                    .arg("FLUSHALL")
+                                    .query_async(&mut conn)
+                                    .map_err(BoxError::from),
+                            )
+                            .await
+                            .unwrap_or_else(|err| Err(BoxError::from(err)))?;
+                        }
+
+                        nodes.push(conn);
+                    }
+                    Ok::<_, BoxError>(())
+                }
+                .await;
+                match cleared_nodes {
+                    Ok(()) => break 'outer,
+                    Err(err) => {
+                        // Failed to clear the databases, retry
+                        log::warn!("{}", err);
+                    }
+                }
             }
             tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
-        };
-        let mut node_urls = Vec::new();
-        let mut nodes = Vec::new();
-        // Clear databases:
-        for (url, master) in node_infos {
-            let redis_client = redis::Client::open(&url[..])
-                .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
-            let mut conn = redis_client
-                .get_multiplexed_tokio_connection()
-                .await
-                .unwrap();
-
-            if master {
-                node_urls.push(url.to_string());
-                let () = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    redis::Cmd::new().arg("FLUSHALL").query_async(&mut conn),
-                )
-                .await
-                .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err))
-                .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
-            }
-
-            nodes.push(conn);
         }
 
-        let client = Client::open(node_urls.iter().map(|s| &s[..]).collect()).unwrap();
+        let client = Client::open(master_urls.iter().map(|s| &s[..]).collect()).unwrap();
 
         RedisEnv {
             client,
