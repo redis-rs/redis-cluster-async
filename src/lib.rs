@@ -58,6 +58,7 @@ use std::{
     mem,
     pin::Pin,
     sync::Arc,
+    task::{self, Poll},
     time::Duration,
 };
 
@@ -67,7 +68,6 @@ use futures::{
     future::{self, BoxFuture},
     prelude::*,
     ready, stream,
-    task::{self, Poll},
 };
 use log::trace;
 use rand::seq::IteratorRandom;
