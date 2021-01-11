@@ -119,8 +119,7 @@ impl MockEnv {
         id: &str,
         handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
     ) -> Self {
-        let mut runtime = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
@@ -150,7 +149,7 @@ fn tryagain_simple() {
 
     let requests = atomic::AtomicUsize::new(0);
     let MockEnv {
-        mut runtime,
+        runtime,
         mut connection,
         handler: _handler,
         ..
@@ -180,7 +179,7 @@ fn tryagain_exhaust_retries() {
     let requests = Arc::new(atomic::AtomicUsize::new(0));
 
     let MockEnv {
-        mut runtime,
+        runtime,
         mut client,
         handler: _handler,
         ..
@@ -222,7 +221,7 @@ fn rebuild_with_extra_nodes() {
     let requests = atomic::AtomicUsize::new(0);
     let started = atomic::AtomicBool::new(false);
     let MockEnv {
-        mut runtime,
+        runtime,
         mut connection,
         handler: _handler,
         ..

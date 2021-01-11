@@ -44,8 +44,7 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     pub fn new() -> Self {
-        let mut runtime = tokio::runtime::Builder::new()
-            .basic_scheduler()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
@@ -118,7 +117,7 @@ impl RedisEnv {
                     }
                 }
             }
-            tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         let client = Client::open(master_urls.iter().map(|s| &s[..]).collect()).unwrap();
@@ -275,7 +274,7 @@ struct FailoverEnv {
 
 impl FailoverEnv {
     fn new() -> Self {
-        let mut env = RuntimeEnv::new();
+        let env = RuntimeEnv::new();
         let connection = env
             .runtime
             .block_on(env.redis.client.get_connection())

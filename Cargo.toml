@@ -14,13 +14,14 @@ edition = "2018"
 [dependencies]
 crc16 = "0.4"
 futures = "0.3"
-rand = "0.7"
-redis = { version = "0.17", features = ["tokio-rt-core"] }
-tokio = { version = "0.2", features = ["time"] }
+pin-project-lite = "0.2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+redis = { version = "0.19", features = ["tokio-comp"] }
+tokio = { version = "1", features = ["time"] }
 log = "0.4"
 
 [dev-dependencies]
 lazy_static = "1"
-tokio = { version = "0.2", features = ["macros", "full"] }
+tokio = { version = "1", features = ["macros", "full"] }
 env_logger = "0.8"
 proptest = "0.10"

@@ -70,6 +70,7 @@ use futures::{
     ready, stream,
 };
 use log::trace;
+use pin_project_lite::pin_project;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
@@ -165,7 +166,7 @@ struct Pipeline<C> {
     slots: SlotMap,
     state: ConnectionState<C>,
     in_flight_requests:
-        Vec<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>,
+        Vec<Pin<Box<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>>>,
     retries: Option<u32>,
 }
 
@@ -277,18 +278,30 @@ struct RequestInfo<C> {
     excludes: HashSet<String>,
 }
 
-enum RequestState<F> {
-    None,
-    Future(F),
-    Delay(tokio::time::Delay),
+pin_project! {
+    #[project = RequestStateProj]
+    enum RequestState<F> {
+        None,
+        Future {
+            #[pin]
+            future: F,
+        },
+        Sleep {
+            #[pin]
+            sleep: tokio::time::Sleep,
+        },
+    }
 }
 
-struct Request<F, I, C> {
-    retry: u32,
-    max_retries: Option<u32>,
-    sender: Option<oneshot::Sender<RedisResult<I>>>,
-    info: RequestInfo<C>,
-    future: RequestState<F>,
+pin_project! {
+    struct Request<F, I, C> {
+        retry: u32,
+        max_retries: Option<u32>,
+        sender: Option<oneshot::Sender<RedisResult<I>>>,
+        info: RequestInfo<C>,
+        #[pin]
+        future: RequestState<F>,
+    }
 }
 
 #[must_use]
@@ -299,18 +312,19 @@ enum Next {
 
 impl<F, I, C> Request<F, I, C>
 where
-    F: Future<Output = (String, RedisResult<I>)> + Unpin,
+    F: Future<Output = (String, RedisResult<I>)>,
     C: ConnectionLike,
 {
     fn poll_request(
-        &mut self,
+        mut self: Pin<&mut Self>,
         cx: &mut task::Context,
         connections_len: usize,
     ) -> Poll<Result<Next, RedisError>> {
-        let future = match &mut self.future {
-            RequestState::Future(f) => Pin::new(f),
-            RequestState::Delay(delay) => {
-                return Ok(match ready!(Pin::new(delay).poll(cx)) {
+        let mut this = self.as_mut().project();
+        let future = match this.future.as_mut().project() {
+            RequestStateProj::Future { future } => future,
+            RequestStateProj::Sleep { sleep } => {
+                return Ok(match ready!(sleep.poll(cx)) {
                     () => Next::TryNewConnection,
                 })
                 .into();
@@ -326,33 +340,35 @@ where
             (addr, Err(err)) => {
                 trace!("Request error {}", err);
 
-                match self.max_retries {
-                    Some(max_retries) if self.retry == max_retries => {
+                match this.max_retries {
+                    Some(max_retries) if this.retry == max_retries => {
                         self.respond(Err(err));
                         return Ok(Next::Done).into();
                     }
                     _ => (),
                 }
-                self.retry = self.retry.saturating_add(1);
+                *this.retry = (*this.retry).saturating_add(1);
 
                 if let Some(error_code) = err.code() {
                     if error_code == "MOVED" || error_code == "ASK" {
                         // Refresh slots and request again.
-                        self.info.excludes.clear();
+                        this.info.excludes.clear();
                         return Err(err).into();
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
                         let sleep_duration =
-                            Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
-                        self.info.excludes.clear();
-                        self.future = RequestState::Delay(tokio::time::delay_for(sleep_duration));
+                            Duration::from_millis(2u64.pow((*this.retry).max(7).min(16)) * 10);
+                        this.info.excludes.clear();
+                        this.future.set(RequestState::Sleep {
+                            sleep: tokio::time::sleep(sleep_duration),
+                        });
                         return self.poll_request(cx, connections_len);
                     }
                 }
 
-                self.info.excludes.insert(addr);
+                this.info.excludes.insert(addr);
 
-                if self.info.excludes.len() >= connections_len {
+                if this.info.excludes.len() >= connections_len {
                     self.respond(Err(err));
                     return Ok(Next::Done).into();
                 }
@@ -362,9 +378,10 @@ where
         }
     }
 
-    fn respond(&mut self, msg: RedisResult<I>) {
+    fn respond(self: Pin<&mut Self>, msg: RedisResult<I>) {
         // If `send` errors the receiver has dropped and thus does not care about the message
         let _ = self
+            .project()
             .sender
             .take()
             .expect("Result should only be sent once")
@@ -588,7 +605,7 @@ where
             future: RequestState::None,
             info,
         };
-        self.in_flight_requests.push(request);
+        self.in_flight_requests.push(Box::pin(request));
         Ok(()).into()
     }
 
@@ -622,12 +639,17 @@ where
                     while i < self.in_flight_requests.len() {
                         if let RequestState::None = self.in_flight_requests[i].future {
                             let future = self.try_request(&self.in_flight_requests[i].info);
-                            self.in_flight_requests[i].future =
-                                RequestState::Future(Box::pin(future));
+                            self.in_flight_requests[i].as_mut().project().future.set(
+                                RequestState::Future {
+                                    future: Box::pin(future),
+                                },
+                            );
                         }
 
                         let self_ = &mut *self;
-                        match self_.in_flight_requests[i].poll_request(cx, self_.connections.len())
+                        match self_.in_flight_requests[i]
+                            .as_mut()
+                            .poll_request(cx, self_.connections.len())
                         {
                             Poll::Pending => {
                                 i += 1;
@@ -639,16 +661,21 @@ where
                                     }
                                     Next::TryNewConnection => {
                                         let mut request = self.in_flight_requests.swap_remove(i);
-                                        request.future = RequestState::Future(Box::pin(
-                                            self.try_request(&request.info),
-                                        ));
+                                        let mut r = request.as_mut().project();
+                                        r.future.set(RequestState::Future {
+                                            future: Box::pin(self.try_request(&r.info)),
+                                        });
                                         self.in_flight_requests.push(request);
                                     }
                                 },
                                 Err(err) => {
                                     error = Some(err);
 
-                                    self.in_flight_requests[i].future = RequestState::None;
+                                    self.in_flight_requests[i]
+                                        .as_mut()
+                                        .project()
+                                        .future
+                                        .set(RequestState::None);
                                     i += 1;
                                 }
                             },
