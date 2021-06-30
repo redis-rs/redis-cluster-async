@@ -564,15 +564,19 @@ where
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
         let cmd = info.cmd.clone();
-        (if info.excludes.len() > 0 || info.slot.is_none() {
+        let f = if info.excludes.len() > 0 || info.slot.is_none() {
             future::Either::Left(future::ready(get_random_connection(
                 &self.connections,
                 Some(&info.excludes),
             )))
         } else {
             future::Either::Right(self.get_connection(info.slot.unwrap()))
-        })
-        .then(move |(addr, conn)| cmd.exec(conn).map(|result| (addr, result)))
+        };
+        async move {
+            let (addr, conn) = f.await;
+            let result = cmd.exec(conn).await;
+            (addr, result)
+        }
     }
 }
 
