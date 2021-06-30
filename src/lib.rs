@@ -306,26 +306,24 @@ pin_project! {
 
 #[must_use]
 enum Next {
-    TryNewConnection,
+    TryNewConnection(Option<RedisError>),
     Done,
 }
 
-impl<F, I, C> Request<F, I, C>
+impl<F, I, C> Future for Request<F, I, C>
 where
     F: Future<Output = (String, RedisResult<I>)>,
     C: ConnectionLike,
 {
-    fn poll_request(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context,
-        connections_len: usize,
-    ) -> Poll<Result<Next, RedisError>> {
+    type Output = Result<Next, RedisError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<Next, RedisError>> {
         let mut this = self.as_mut().project();
         let future = match this.future.as_mut().project() {
             RequestStateProj::Future { future } => future,
             RequestStateProj::Sleep { sleep } => {
                 return Ok(match ready!(sleep.poll(cx)) {
-                    () => Next::TryNewConnection,
+                    () => Next::TryNewConnection(None),
                 })
                 .into();
             }
@@ -362,22 +360,23 @@ where
                         this.future.set(RequestState::Sleep {
                             sleep: tokio::time::sleep(sleep_duration),
                         });
-                        return self.poll_request(cx, connections_len);
+                        return self.poll(cx);
                     }
                 }
 
                 this.info.excludes.insert(addr);
 
-                if this.info.excludes.len() >= connections_len {
-                    self.respond(Err(err));
-                    return Ok(Next::Done).into();
-                }
-
-                Ok(Next::TryNewConnection).into()
+                Ok(Next::TryNewConnection(Some(err))).into()
             }
         }
     }
+}
 
+impl<F, I, C> Request<F, I, C>
+where
+    F: Future<Output = (String, RedisResult<I>)>,
+    C: ConnectionLike,
+{
     fn respond(self: Pin<&mut Self>, msg: RedisResult<I>) {
         // If `send` errors the receiver has dropped and thus does not care about the message
         let _ = self
@@ -651,10 +650,7 @@ where
                         }
 
                         let self_ = &mut *self;
-                        match self_.in_flight_requests[i]
-                            .as_mut()
-                            .poll_request(cx, self_.connections.len())
-                        {
+                        match self_.in_flight_requests[i].as_mut().poll(cx) {
                             Poll::Pending => {
                                 i += 1;
                             }
@@ -663,7 +659,18 @@ where
                                     Next::Done => {
                                         self.in_flight_requests.swap_remove(i);
                                     }
-                                    Next::TryNewConnection => {
+                                    Next::TryNewConnection(error) => {
+                                        if let Some(error) = error {
+                                            if self_.in_flight_requests[i].info.excludes.len()
+                                                >= self_.connections.len()
+                                            {
+                                                self.in_flight_requests[i]
+                                                    .as_mut()
+                                                    .respond(Err(error));
+                                                self.in_flight_requests.swap_remove(i);
+                                                continue;
+                                            }
+                                        }
                                         let mut request = self.in_flight_requests.swap_remove(i);
                                         let mut r = request.as_mut().project();
                                         r.future.set(RequestState::Future {
