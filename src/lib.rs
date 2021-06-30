@@ -165,8 +165,10 @@ struct Pipeline<C> {
     connections: HashMap<String, C>,
     slots: SlotMap,
     state: ConnectionState<C>,
-    in_flight_requests:
-        Vec<Pin<Box<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>>>,
+    in_flight_requests: stream::FuturesUnordered<
+        Pin<Box<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>>,
+    >,
+    pending_requests: Vec<PendingRequest<Response, C>>,
     retries: Option<u32>,
 }
 
@@ -293,20 +295,31 @@ pin_project! {
     }
 }
 
+struct PendingRequest<I, C> {
+    retry: u32,
+    sender: oneshot::Sender<RedisResult<I>>,
+    info: RequestInfo<C>,
+}
+
 pin_project! {
     struct Request<F, I, C> {
-        retry: u32,
         max_retries: Option<u32>,
-        sender: Option<oneshot::Sender<RedisResult<I>>>,
-        info: RequestInfo<C>,
+        request: Option<PendingRequest<I, C>>,
         #[pin]
         future: RequestState<F>,
     }
 }
 
 #[must_use]
-enum Next {
-    TryNewConnection(Option<RedisError>),
+enum Next<I, C> {
+    TryNewConnection {
+        request: PendingRequest<I, C>,
+        error: Option<RedisError>,
+    },
+    Err {
+        request: PendingRequest<I, C>,
+        error: RedisError,
+    },
     Done,
 }
 
@@ -315,16 +328,19 @@ where
     F: Future<Output = (String, RedisResult<I>)>,
     C: ConnectionLike,
 {
-    type Output = Result<Next, RedisError>;
+    type Output = Next<I, C>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<Next, RedisError>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
         let future = match this.future.as_mut().project() {
             RequestStateProj::Future { future } => future,
             RequestStateProj::Sleep { sleep } => {
-                return Ok(match ready!(sleep.poll(cx)) {
-                    () => Next::TryNewConnection(None),
-                })
+                return match ready!(sleep.poll(cx)) {
+                    () => Next::TryNewConnection {
+                        request: self.project().request.take().unwrap(),
+                        error: None,
+                    },
+                }
                 .into();
             }
             _ => panic!("Request future must be Some"),
@@ -333,30 +349,36 @@ where
             (_, Ok(item)) => {
                 trace!("Ok");
                 self.respond(Ok(item));
-                Ok(Next::Done).into()
+                Next::Done.into()
             }
             (addr, Err(err)) => {
                 trace!("Request error {}", err);
 
-                match this.max_retries {
-                    Some(max_retries) if this.retry == max_retries => {
+                let request = this.request.as_mut().unwrap();
+
+                match *this.max_retries {
+                    Some(max_retries) if request.retry >= max_retries => {
                         self.respond(Err(err));
-                        return Ok(Next::Done).into();
+                        return Next::Done.into();
                     }
                     _ => (),
                 }
-                *this.retry = (*this.retry).saturating_add(1);
+                request.retry = request.retry.saturating_add(1);
 
                 if let Some(error_code) = err.code() {
                     if error_code == "MOVED" || error_code == "ASK" {
                         // Refresh slots and request again.
-                        this.info.excludes.clear();
-                        return Err(err).into();
+                        request.info.excludes.clear();
+                        return Next::Err {
+                            request: this.request.take().unwrap(),
+                            error: err,
+                        }
+                        .into();
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
                         let sleep_duration =
-                            Duration::from_millis(2u64.pow((*this.retry).max(7).min(16)) * 10);
-                        this.info.excludes.clear();
+                            Duration::from_millis(2u64.pow(request.retry.max(7).min(16)) * 10);
+                        request.info.excludes.clear();
                         this.future.set(RequestState::Sleep {
                             sleep: tokio::time::sleep(sleep_duration),
                         });
@@ -364,9 +386,13 @@ where
                     }
                 }
 
-                this.info.excludes.insert(addr);
+                request.info.excludes.insert(addr);
 
-                Ok(Next::TryNewConnection(Some(err))).into()
+                Next::TryNewConnection {
+                    request: this.request.take().unwrap(),
+                    error: Some(err),
+                }
+                .into()
             }
         }
     }
@@ -381,9 +407,10 @@ where
         // If `send` errors the receiver has dropped and thus does not care about the message
         let _ = self
             .project()
-            .sender
+            .request
             .take()
             .expect("Result should only be sent once")
+            .sender
             .send(msg);
     }
 }
@@ -397,7 +424,8 @@ where
         let mut connection = Pipeline {
             connections,
             slots: Default::default(),
-            in_flight_requests: Vec::new(),
+            in_flight_requests: Default::default(),
+            pending_requests: Vec::new(),
             state: ConnectionState::PollComplete,
             retries,
         };
@@ -591,7 +619,7 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
         trace!("start_send");
-        let cmd = msg.cmd;
+        let Message { cmd, sender } = msg;
 
         let excludes = HashSet::new();
         let slot = cmd.slot();
@@ -601,14 +629,12 @@ where
             slot,
             excludes,
         };
-        let request = Request {
-            max_retries: self.retries,
+
+        self.pending_requests.push(PendingRequest {
             retry: 0,
-            sender: Some(msg.sender),
-            future: RequestState::None,
+            sender,
             info,
-        };
-        self.in_flight_requests.push(Box::pin(request));
+        });
         Ok(()).into()
     }
 
@@ -637,59 +663,53 @@ where
                 },
                 ConnectionState::PollComplete => {
                     let mut error = None;
-                    let mut i = 0;
 
-                    while i < self.in_flight_requests.len() {
-                        if let RequestState::None = self.in_flight_requests[i].future {
-                            let future = self.try_request(&self.in_flight_requests[i].info);
-                            self.in_flight_requests[i].as_mut().project().future.set(
-                                RequestState::Future {
-                                    future: Box::pin(future),
+                    if !self.pending_requests.is_empty() {
+                        let mut pending_requests = mem::take(&mut self.pending_requests);
+                        for request in pending_requests.drain(..) {
+                            let future = self.try_request(&request.info);
+                            self.in_flight_requests.push(Box::pin(Request {
+                                max_retries: self.retries,
+                                request: Some(request),
+                                future: RequestState::Future {
+                                    future: future.boxed(),
                                 },
-                            );
+                            }));
                         }
+                        self.pending_requests = pending_requests;
+                    }
 
+                    loop {
+                        let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
+                            Poll::Ready(Some(result)) => result,
+                            Poll::Ready(None) | Poll::Pending => break,
+                        };
                         let self_ = &mut *self;
-                        match self_.in_flight_requests[i].as_mut().poll(cx) {
-                            Poll::Pending => {
-                                i += 1;
-                            }
-                            Poll::Ready(result) => match result {
-                                Ok(next) => match next {
-                                    Next::Done => {
-                                        self.in_flight_requests.swap_remove(i);
+                        match result {
+                            Next::Done => {}
+                            Next::TryNewConnection { request, error } => {
+                                if let Some(error) = error {
+                                    if request.info.excludes.len() >= self_.connections.len() {
+                                        let _ = request.sender.send(Err(error));
+                                        continue;
                                     }
-                                    Next::TryNewConnection(error) => {
-                                        if let Some(error) = error {
-                                            if self_.in_flight_requests[i].info.excludes.len()
-                                                >= self_.connections.len()
-                                            {
-                                                self.in_flight_requests[i]
-                                                    .as_mut()
-                                                    .respond(Err(error));
-                                                self.in_flight_requests.swap_remove(i);
-                                                continue;
-                                            }
-                                        }
-                                        let mut request = self.in_flight_requests.swap_remove(i);
-                                        let mut r = request.as_mut().project();
-                                        r.future.set(RequestState::Future {
-                                            future: Box::pin(self.try_request(&r.info)),
-                                        });
-                                        self.in_flight_requests.push(request);
-                                    }
-                                },
-                                Err(err) => {
-                                    error = Some(err);
-
-                                    self.in_flight_requests[i]
-                                        .as_mut()
-                                        .project()
-                                        .future
-                                        .set(RequestState::None);
-                                    i += 1;
                                 }
-                            },
+                                let future = self.try_request(&request.info);
+                                self.in_flight_requests.push(Box::pin(Request {
+                                    max_retries: self.retries,
+                                    request: Some(request),
+                                    future: RequestState::Future {
+                                        future: Box::pin(future),
+                                    },
+                                }));
+                            }
+                            Next::Err {
+                                request,
+                                error: err,
+                            } => {
+                                error = Some(err);
+                                self.pending_requests.push(request);
+                            }
                         }
                     }
 
