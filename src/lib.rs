@@ -149,13 +149,11 @@ where
         initial_nodes: &[ConnectionInfo],
         retries: Option<u32>,
     ) -> RedisResult<Connection<C>> {
-        Pipeline::new(initial_nodes, retries)
-            .map_ok(|pipeline| {
-                let (tx, rx) = mpsc::channel::<Message<_>>(100);
-                tokio::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
-                Connection(tx)
-            })
-            .await
+        Pipeline::new(initial_nodes, retries).await.map(|pipeline| {
+            let (tx, rx) = mpsc::channel::<Message<_>>(100);
+            tokio::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
+            Connection(tx)
+        })
     }
 }
 
@@ -168,6 +166,7 @@ struct Pipeline<C> {
     in_flight_requests: stream::FuturesUnordered<
         Pin<Box<Request<BoxFuture<'static, (String, RedisResult<Response>)>, Response, C>>>,
     >,
+    refresh_error: Option<RedisError>,
     pending_requests: Vec<PendingRequest<Response, C>>,
     retries: Option<u32>,
 }
@@ -332,6 +331,9 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
+        if this.request.is_none() {
+            return Poll::Ready(Next::Done);
+        }
         let future = match this.future.as_mut().project() {
             RequestStateProj::Future { future } => future,
             RequestStateProj::Sleep { sleep } => {
@@ -425,6 +427,7 @@ where
             connections,
             slots: Default::default(),
             in_flight_requests: Default::default(),
+            refresh_error: None,
             pending_requests: Vec::new(),
             state: ConnectionState::PollComplete,
             retries,
@@ -605,6 +608,31 @@ where
             (addr, result)
         }
     }
+
+    fn poll_recover(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        mut future: RedisFuture<'static, (SlotMap, HashMap<String, C>)>,
+    ) -> Poll<Result<(), RedisError>> {
+        match future.as_mut().poll(cx) {
+            Poll::Ready(Ok((slots, connections))) => {
+                trace!("Recovered with {} connections!", connections.len());
+                self.slots = slots;
+                self.connections = connections;
+                self.state = ConnectionState::PollComplete;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                self.state = ConnectionState::Recover(future);
+                trace!("Recover not ready");
+                Poll::Pending
+            }
+            Poll::Ready(Err(err)) => {
+                self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
+                Poll::Ready(Err(err))
+            }
+        }
+    }
 }
 
 impl<C> Sink<Message<C>> for Pipeline<C>
@@ -613,13 +641,42 @@ where
 {
     type Error = ();
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
-        Ok(()).into()
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
+        match mem::replace(&mut self.state, ConnectionState::PollComplete) {
+            ConnectionState::PollComplete => Poll::Ready(Ok(())),
+            ConnectionState::Recover(future) => {
+                match ready!(self.as_mut().poll_recover(cx, future)) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(err) => {
+                        // We failed to reconnect, while we will try again we will report the
+                        // error if we can to avoid getting trapped in an infinite loop of
+                        // trying to reconnect
+                        if let Some(mut request) = Pin::new(&mut self.in_flight_requests)
+                            .iter_pin_mut()
+                            .find(|request| request.request.is_some())
+                        {
+                            (*request).as_mut().respond(Err(err));
+                        } else {
+                            self.refresh_error = Some(err);
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                }
+            }
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
         trace!("start_send");
         let Message { cmd, sender } = msg;
+
+        if let Some(err) = self.refresh_error.take() {
+            let _ = sender.send(Err(err));
+            return Ok(());
+        }
 
         let excludes = HashSet::new();
         let slot = cmd.slot();
@@ -644,23 +701,23 @@ where
     ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_complete: {:?}", self.state);
         loop {
-            self.state = match mem::replace(&mut self.state, ConnectionState::PollComplete) {
-                ConnectionState::Recover(mut future) => match future.as_mut().poll(cx) {
-                    Poll::Ready(Ok((slots, connections))) => {
-                        trace!("Recovered with {} connections!", connections.len());
-                        self.slots = slots;
-                        self.connections = connections;
-                        ConnectionState::PollComplete
+            match mem::replace(&mut self.state, ConnectionState::PollComplete) {
+                ConnectionState::Recover(future) => {
+                    match ready!(self.as_mut().poll_recover(cx, future)) {
+                        Ok(()) => (),
+                        Err(err) => {
+                            // We failed to reconnect, while we will try again we will report the
+                            // error if we can to avoid getting trapped in an infinite loop of
+                            // trying to reconnect
+                            if let Some(mut request) = Pin::new(&mut self.in_flight_requests)
+                                .iter_pin_mut()
+                                .find(|request| request.request.is_some())
+                            {
+                                (*request).as_mut().respond(Err(err));
+                            }
+                        }
                     }
-                    Poll::Pending => {
-                        self.state = ConnectionState::Recover(future);
-                        trace!("Recover not ready");
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(_err)) => {
-                        ConnectionState::Recover(Box::pin(self.refresh_slots()))
-                    }
-                },
+                }
                 ConnectionState::PollComplete => {
                     let mut error = None;
 
@@ -715,7 +772,7 @@ where
 
                     if let Some(err) = error {
                         trace!("Recovering {}", err);
-                        ConnectionState::Recover(Box::pin(self.refresh_slots()))
+                        self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     } else if self.in_flight_requests.is_empty() {
                         return Ok(()).into();
                     } else {
@@ -745,7 +802,7 @@ where
                         cmd: Arc::new(cmd.clone()), // TODO Remove this clone?
                         func: |mut conn, cmd| {
                             Box::pin(async move {
-                                conn.req_packed_command(&cmd).map_ok(Response::Single).await
+                                conn.req_packed_command(&cmd).await.map(Response::Single)
                             })
                         },
                     },
@@ -790,8 +847,8 @@ where
                         func: |mut conn, pipeline, offset, count| {
                             Box::pin(async move {
                                 conn.req_packed_commands(&pipeline, offset, count)
-                                    .map_ok(Response::Multiple)
                                     .await
+                                    .map(Response::Multiple)
                             })
                         },
                     },
