@@ -1,18 +1,25 @@
 use std::{
     cell::Cell,
-    error::Error,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
 };
 
 use {
     futures::{prelude::*, stream},
+    once_cell::sync::Lazy,
     proptest::proptest,
     tokio::runtime::Runtime,
 };
 
 use redis_cluster_async::{
-    redis::{cmd, AsyncCommands, RedisError, RedisResult, Script},
-    Client,
+    redis::{
+        aio::{ConnectionLike, MultiplexedConnection},
+        cmd, AsyncCommands, Cmd, IntoConnectionInfo, RedisError, RedisFuture, RedisResult, Script,
+        Value,
+    },
+    Client, Connect,
 };
 
 const REDIS_URL: &str = "redis://127.0.0.1:7000/";
@@ -23,9 +30,7 @@ pub struct RedisLock(MutexGuard<'static, RedisProcess>);
 impl RedisProcess {
     // Blocks until we have sole access.
     pub fn lock() -> RedisLock {
-        lazy_static::lazy_static! {
-            static ref REDIS: Mutex<RedisProcess> = Mutex::new(RedisProcess {});
-        }
+        static REDIS: Lazy<Mutex<RedisProcess>> = Lazy::new(|| Mutex::new(RedisProcess {}));
 
         // If we panic in a test we don't want subsequent to fail because of a poisoned error
         let redis_lock = REDIS
@@ -59,8 +64,6 @@ pub struct RedisEnv {
     nodes: Vec<redis::aio::MultiplexedConnection>,
 }
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 impl RedisEnv {
     pub async fn new() -> Self {
         let _ = env_logger::try_init();
@@ -93,20 +96,20 @@ impl RedisEnv {
 
                         if master {
                             master_urls.push(url.to_string());
-                            let () = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                redis::Cmd::new()
-                                    .arg("FLUSHALL")
-                                    .query_async(&mut conn)
-                                    .map_err(BoxError::from),
-                            )
-                            .await
-                            .unwrap_or_else(|err| Err(BoxError::from(err)))?;
+                            let () =
+                                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                                    Ok(redis::Cmd::new()
+                                        .arg("FLUSHALL")
+                                        .query_async(&mut conn)
+                                        .await?)
+                                })
+                                .await
+                                .unwrap_or_else(|err| Err(anyhow::Error::from(err)))?;
                         }
 
                         nodes.push(conn);
                     }
-                    Ok::<_, BoxError>(())
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 match cleared_nodes {
@@ -136,7 +139,8 @@ impl RedisEnv {
         redis::cmd("CLUSTER")
             .arg("NODES")
             .query_async(redis_client)
-            .map_ok(|s: String| {
+            .await
+            .map(|s: String| {
                 s.lines()
                     .map(|line| {
                         let mut iter = line.split(' ');
@@ -157,7 +161,6 @@ impl RedisEnv {
                     })
                     .collect::<Vec<_>>()
             })
-            .await
     }
 }
 
@@ -284,14 +287,9 @@ impl FailoverEnv {
     }
 }
 
-async fn do_failover(
-    redis: &mut redis::aio::MultiplexedConnection,
-) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    cmd("CLUSTER")
-        .arg("FAILOVER")
-        .query_async(redis)
-        .err_into()
-        .await
+async fn do_failover(redis: &mut redis::aio::MultiplexedConnection) -> Result<(), anyhow::Error> {
+    cmd("CLUSTER").arg("FAILOVER").query_async(redis).await?;
+    Ok(())
 }
 
 fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
@@ -310,12 +308,13 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
                 async move {
                     if i == requests / 2 {
                         // Failover all the nodes, error only if all the failover requests error
-                        nodes.iter_mut().map(|node| do_failover(node))
+                        nodes
+                            .iter_mut()
+                            .map(|node| do_failover(node))
                             .collect::<stream::FuturesUnordered<_>>()
                             .fold(
-                                Err(Box::<dyn Error + Send + Sync>::from("None".to_string())),
-                                |acc: Result<(), Box<dyn Error + Send + Sync>>,
-                                 result: Result<(), Box<dyn Error + Send + Sync>>| async move {
+                                Err(anyhow::anyhow!("None")),
+                                |acc: Result<(), _>, result: Result<(), _>| async move {
                                     acc.or_else(|_| result)
                                 },
                             )
@@ -335,7 +334,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
                             .await?;
                         assert_eq!(res, i);
                         completed.set(completed.get() + 1);
-                        Ok(())
+                        Ok::<_, anyhow::Error>(())
                     }
                 }
             })
@@ -347,4 +346,71 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
         .block_on(test_future)
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(completed.get(), requests, "Some requests never completed!");
+}
+
+static ERROR: Lazy<AtomicBool> = Lazy::new(Default::default);
+
+#[derive(Clone)]
+struct ErrorConnection {
+    inner: MultiplexedConnection,
+}
+
+impl Connect for ErrorConnection {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
+    where
+        T: IntoConnectionInfo + Send + 'a,
+    {
+        Box::pin(async {
+            let inner = MultiplexedConnection::connect(info).await?;
+            Ok(ErrorConnection { inner })
+        })
+    }
+}
+
+impl ConnectionLike for ErrorConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        if ERROR.load(Ordering::SeqCst) {
+            Box::pin(async move { Err(RedisError::from((redis::ErrorKind::Moved, "ERROR"))) })
+        } else {
+            self.inner.req_packed_command(cmd)
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        self.inner.req_packed_commands(pipeline, offset, count)
+    }
+
+    fn get_db(&self) -> i64 {
+        self.inner.get_db()
+    }
+}
+
+#[tokio::test]
+async fn error_in_inner_connection() -> Result<(), anyhow::Error> {
+    let _ = env_logger::try_init();
+
+    let env = RedisEnv::new().await;
+    let mut con = env
+        .client
+        .get_generic_connection::<ErrorConnection>()
+        .await?;
+
+    ERROR.store(false, Ordering::SeqCst);
+    let r: Option<i32> = con.get("test").await?;
+    assert_eq!(r, None::<i32>);
+
+    ERROR.store(true, Ordering::SeqCst);
+
+    let result: RedisResult<()> = con.get("test").await;
+    assert_eq!(
+        result,
+        Err(RedisError::from((redis::ErrorKind::Moved, "ERROR")))
+    );
+
+    Ok(())
 }
