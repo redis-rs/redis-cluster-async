@@ -1,18 +1,26 @@
 use std::{
     cell::Cell,
     error::Error,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
 };
 
 use {
     futures::{prelude::*, stream},
+    once_cell::sync::Lazy,
     proptest::proptest,
     tokio::runtime::Runtime,
 };
 
 use redis_cluster_async::{
-    redis::{cmd, AsyncCommands, RedisError, RedisResult, Script},
-    Client,
+    redis::{
+        aio::{ConnectionLike, MultiplexedConnection},
+        cmd, AsyncCommands, Cmd, IntoConnectionInfo, RedisError, RedisFuture, RedisResult, Script,
+        Value,
+    },
+    Client, Connect,
 };
 
 const REDIS_URL: &str = "redis://127.0.0.1:7000/";
@@ -23,9 +31,7 @@ pub struct RedisLock(MutexGuard<'static, RedisProcess>);
 impl RedisProcess {
     // Blocks until we have sole access.
     pub fn lock() -> RedisLock {
-        lazy_static::lazy_static! {
-            static ref REDIS: Mutex<RedisProcess> = Mutex::new(RedisProcess {});
-        }
+        static REDIS: Lazy<Mutex<RedisProcess>> = Lazy::new(|| Mutex::new(RedisProcess {}));
 
         // If we panic in a test we don't want subsequent to fail because of a poisoned error
         let redis_lock = REDIS
@@ -347,4 +353,70 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
         .block_on(test_future)
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(completed.get(), requests, "Some requests never completed!");
+}
+
+static ERROR: Lazy<AtomicBool> = Lazy::new(Default::default);
+
+#[derive(Clone)]
+struct ErrorConnection {
+    inner: MultiplexedConnection,
+}
+
+impl Connect for ErrorConnection {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
+    where
+        T: IntoConnectionInfo + Send + 'a,
+    {
+        MultiplexedConnection::connect(info)
+            .map_ok(|inner| ErrorConnection { inner })
+            .boxed()
+    }
+}
+
+impl ConnectionLike for ErrorConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        if ERROR.load(Ordering::SeqCst) {
+            Box::pin(async move { Err(RedisError::from((redis::ErrorKind::Moved, "ERROR"))) })
+        } else {
+            self.inner.req_packed_command(cmd)
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        self.inner.req_packed_commands(pipeline, offset, count)
+    }
+
+    fn get_db(&self) -> i64 {
+        self.inner.get_db()
+    }
+}
+
+#[tokio::test]
+async fn error_in_inner_connection() -> Result<(), anyhow::Error> {
+    let _ = env_logger::try_init();
+
+    let env = RedisEnv::new().await;
+    let mut con = env
+        .client
+        .get_generic_connection::<ErrorConnection>()
+        .await?;
+
+    ERROR.store(false, Ordering::SeqCst);
+    let r: Option<i32> = con.get("test").await?;
+    assert_eq!(r, None::<i32>);
+
+    ERROR.store(true, Ordering::SeqCst);
+
+    let result: RedisResult<()> = con.get("test").await;
+    assert_eq!(
+        result,
+        Err(RedisError::from((redis::ErrorKind::Moved, "ERROR")))
+    );
+
+    Ok(())
 }

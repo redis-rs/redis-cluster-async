@@ -255,9 +255,12 @@ struct Message<C> {
     sender: oneshot::Sender<RedisResult<Response>>,
 }
 
+type RecoverFuture<C> =
+    BoxFuture<'static, Result<(SlotMap, HashMap<String, C>), (RedisError, HashMap<String, C>)>>;
+
 enum ConnectionState<C> {
     PollComplete,
-    Recover(RedisFuture<'static, (SlotMap, HashMap<String, C>)>),
+    Recover(RecoverFuture<C>),
 }
 
 impl<C> fmt::Debug for ConnectionState<C> {
@@ -432,7 +435,7 @@ where
             state: ConnectionState::PollComplete,
             retries,
         };
-        let (slots, connections) = connection.refresh_slots().await?;
+        let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
         connection.slots = slots;
         connection.connections = connections;
         Ok(connection)
@@ -478,7 +481,8 @@ where
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(
         &mut self,
-    ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
+    ) -> impl Future<Output = Result<(SlotMap, HashMap<String, C>), (RedisError, HashMap<String, C>)>>
+    {
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
@@ -495,7 +499,10 @@ where
                     Err(err) => result = Err(err),
                 }
             }
-            let slots = result?;
+            let slots = match result {
+                Ok(slots) => slots,
+                Err(err) => return Err((err, connections)),
+            };
 
             // Remove dead connections and connect to new nodes if necessary
             let new_connections = HashMap::with_capacity(connections.len());
@@ -612,7 +619,7 @@ where
     fn poll_recover(
         &mut self,
         cx: &mut task::Context<'_>,
-        mut future: RedisFuture<'static, (SlotMap, HashMap<String, C>)>,
+        mut future: RecoverFuture<C>,
     ) -> Poll<Result<(), RedisError>> {
         match future.as_mut().poll(cx) {
             Poll::Ready(Ok((slots, connections))) => {
@@ -627,7 +634,8 @@ where
                 trace!("Recover not ready");
                 Poll::Pending
             }
-            Poll::Ready(Err(err)) => {
+            Poll::Ready(Err((err, connections))) => {
+                self.connections = connections;
                 self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
                 Poll::Ready(Err(err))
             }
@@ -691,6 +699,21 @@ where
             Poll::Pending
         }
     }
+
+    fn send_refresh_error(&mut self) {
+        if self.refresh_error.is_some() {
+            if let Some(mut request) = Pin::new(&mut self.in_flight_requests)
+                .iter_pin_mut()
+                .find(|request| request.request.is_some())
+            {
+                (*request)
+                    .as_mut()
+                    .respond(Err(self.refresh_error.take().unwrap()));
+            } else if let Some(request) = self.pending_requests.pop() {
+                let _ = request.sender.send(Err(self.refresh_error.take().unwrap()));
+            }
+        }
+    }
 }
 
 impl<C> Sink<Message<C>> for Pipeline<C>
@@ -731,11 +754,6 @@ where
         trace!("start_send");
         let Message { cmd, sender } = msg;
 
-        if let Some(err) = self.refresh_error.take() {
-            let _ = sender.send(Err(err));
-            return Ok(());
-        }
-
         let excludes = HashSet::new();
         let slot = cmd.slot();
 
@@ -759,6 +777,8 @@ where
     ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_complete: {:?}", self.state);
         loop {
+            self.send_refresh_error();
+
             match mem::replace(&mut self.state, ConnectionState::PollComplete) {
                 ConnectionState::Recover(future) => {
                     match ready!(self.as_mut().poll_recover(cx, future)) {
@@ -767,12 +787,13 @@ where
                             // We failed to reconnect, while we will try again we will report the
                             // error if we can to avoid getting trapped in an infinite loop of
                             // trying to reconnect
-                            if let Some(mut request) = Pin::new(&mut self.in_flight_requests)
-                                .iter_pin_mut()
-                                .find(|request| request.request.is_some())
-                            {
-                                (*request).as_mut().respond(Err(err));
-                            }
+                            self.refresh_error = Some(err);
+
+                            // Give other tasks a chance to progress before we try to recover
+                            // again. Since the future may not have registered a wake up we do so
+                            // now so the task is not forgotten
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                     }
                 }

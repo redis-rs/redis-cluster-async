@@ -5,6 +5,7 @@ use std::{
 
 use {
     futures::future,
+    once_cell::sync::Lazy,
     redis_cluster_async::{
         redis::{
             aio::ConnectionLike, cmd, parse_redis_value, IntoConnectionInfo, RedisFuture,
@@ -17,10 +18,7 @@ use {
 
 type Handler = Arc<dyn Fn(&redis::Cmd, u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
 
-lazy_static::lazy_static! {
-    static ref HANDLERS: RwLock<HashMap<String, Handler>>
-        = Default::default();
-}
+static HANDLERS: Lazy<RwLock<HashMap<String, Handler>>> = Lazy::new(Default::default);
 
 #[derive(Clone)]
 pub struct MockConnection {
