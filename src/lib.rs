@@ -719,7 +719,7 @@ where
                     }
                 }
                 ConnectionState::PollComplete => {
-                    let mut error = None;
+                    let mut connection_error = None;
 
                     if !self.pending_requests.is_empty() {
                         let mut pending_requests = mem::take(&mut self.pending_requests);
@@ -760,17 +760,14 @@ where
                                     },
                                 }));
                             }
-                            Next::Err {
-                                request,
-                                error: err,
-                            } => {
-                                error = Some(err);
+                            Next::Err { request, error } => {
+                                connection_error = Some(error);
                                 self.pending_requests.push(request);
                             }
                         }
                     }
 
-                    if let Some(err) = error {
+                    if let Some(err) = connection_error {
                         trace!("Recovering {}", err);
                         self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     } else if self.in_flight_requests.is_empty() {
