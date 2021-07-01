@@ -633,6 +633,64 @@ where
             }
         }
     }
+
+    fn poll_complete(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), RedisError>> {
+        let mut connection_error = None;
+
+        if !self.pending_requests.is_empty() {
+            let mut pending_requests = mem::take(&mut self.pending_requests);
+            for request in pending_requests.drain(..) {
+                let future = self.try_request(&request.info);
+                self.in_flight_requests.push(Box::pin(Request {
+                    max_retries: self.retries,
+                    request: Some(request),
+                    future: RequestState::Future {
+                        future: future.boxed(),
+                    },
+                }));
+            }
+            self.pending_requests = pending_requests;
+        }
+
+        loop {
+            let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
+                Poll::Ready(Some(result)) => result,
+                Poll::Ready(None) | Poll::Pending => break,
+            };
+            let self_ = &mut *self;
+            match result {
+                Next::Done => {}
+                Next::TryNewConnection { request, error } => {
+                    if let Some(error) = error {
+                        if request.info.excludes.len() >= self_.connections.len() {
+                            let _ = request.sender.send(Err(error));
+                            continue;
+                        }
+                    }
+                    let future = self.try_request(&request.info);
+                    self.in_flight_requests.push(Box::pin(Request {
+                        max_retries: self.retries,
+                        request: Some(request),
+                        future: RequestState::Future {
+                            future: Box::pin(future),
+                        },
+                    }));
+                }
+                Next::Err { request, error } => {
+                    connection_error = Some(error);
+                    self.pending_requests.push(request);
+                }
+            }
+        }
+
+        if let Some(err) = connection_error {
+            Poll::Ready(Err(err))
+        } else if self.in_flight_requests.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl<C> Sink<Message<C>> for Pipeline<C>
@@ -718,69 +776,34 @@ where
                         }
                     }
                 }
-                ConnectionState::PollComplete => {
-                    let mut connection_error = None;
-
-                    if !self.pending_requests.is_empty() {
-                        let mut pending_requests = mem::take(&mut self.pending_requests);
-                        for request in pending_requests.drain(..) {
-                            let future = self.try_request(&request.info);
-                            self.in_flight_requests.push(Box::pin(Request {
-                                max_retries: self.retries,
-                                request: Some(request),
-                                future: RequestState::Future {
-                                    future: future.boxed(),
-                                },
-                            }));
-                        }
-                        self.pending_requests = pending_requests;
-                    }
-
-                    loop {
-                        let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
-                            Poll::Ready(Some(result)) => result,
-                            Poll::Ready(None) | Poll::Pending => break,
-                        };
-                        let self_ = &mut *self;
-                        match result {
-                            Next::Done => {}
-                            Next::TryNewConnection { request, error } => {
-                                if let Some(error) = error {
-                                    if request.info.excludes.len() >= self_.connections.len() {
-                                        let _ = request.sender.send(Err(error));
-                                        continue;
-                                    }
-                                }
-                                let future = self.try_request(&request.info);
-                                self.in_flight_requests.push(Box::pin(Request {
-                                    max_retries: self.retries,
-                                    request: Some(request),
-                                    future: RequestState::Future {
-                                        future: Box::pin(future),
-                                    },
-                                }));
-                            }
-                            Next::Err { request, error } => {
-                                connection_error = Some(error);
-                                self.pending_requests.push(request);
-                            }
-                        }
-                    }
-
-                    if let Some(err) = connection_error {
+                ConnectionState::PollComplete => match ready!(self.poll_complete(cx)) {
+                    Ok(()) => return Poll::Ready(Ok(())),
+                    Err(err) => {
                         trace!("Recovering {}", err);
-                        self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()))
-                    } else if self.in_flight_requests.is_empty() {
-                        return Ok(()).into();
-                    } else {
-                        return Poll::Pending;
+                        self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
                     }
-                }
+                },
             }
         }
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
+        // Try to drive any in flight requests to completion
+        match self.poll_complete(cx) {
+            Poll::Ready(result) => {
+                result.map_err(|_| ())?;
+            }
+            Poll::Pending => (),
+        };
+        // If we no longer have any requests in flight we are done (skips any reconnection
+        // attempts)
+        if self.in_flight_requests.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
         self.poll_flush(cx)
     }
 }
