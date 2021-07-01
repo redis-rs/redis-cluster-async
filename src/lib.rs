@@ -441,8 +441,8 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
     ) -> RedisResult<HashMap<String, C>> {
-        stream::iter(initial_nodes)
-            .then(|info| {
+        let connections = stream::iter(initial_nodes)
+            .map(|info| async move {
                 let addr = match *info.addr {
                     ConnectionAddr::Tcp(ref host, port) => match &info.passwd {
                         Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
@@ -451,11 +451,13 @@ where
                     _ => panic!("No reach."),
                 };
 
-                connect_and_check(info.clone()).map(|result| match result {
+                let result = connect_and_check(info.clone()).await;
+                match result {
                     Ok(conn) => Some((addr, conn)),
                     Err(_) => None,
-                })
+                }
             })
+            .buffer_unordered(initial_nodes.len())
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
                 |mut connections: HashMap<String, C>, conn: Option<(String, C)>| async move {
@@ -463,16 +465,14 @@ where
                     connections
                 },
             )
-            .map(|connections| {
-                if connections.len() == 0 {
-                    return Err(RedisError::from((
-                        ErrorKind::IoError,
-                        "Failed to create initial connections",
-                    )));
-                }
-                Ok(connections)
-            })
-            .await
+            .await;
+        if connections.len() == 0 {
+            return Err(RedisError::from((
+                ErrorKind::IoError,
+                "Failed to create initial connections",
+            )));
+        }
+        Ok(connections)
     }
 
     // Query a node to discover slot-> master mappings.
@@ -808,13 +808,13 @@ where
                     },
                     sender,
                 })
+                .await
                 .map_err(|_| {
                     RedisError::from(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "redis_cluster: Unable to send command",
                     ))
-                })
-                .await?;
+                })?;
             receiver
                 .await
                 .unwrap_or_else(|_| {
@@ -854,8 +854,8 @@ where
                     },
                     sender,
                 })
-                .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-                .await?;
+                .await
+                .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
             receiver
                 .await
@@ -1004,13 +1004,10 @@ where
     trace!("get_slots");
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
-    let value = connection
-        .req_packed_command(&cmd)
-        .map_err(|err| {
-            trace!("get_slots error: {}", err);
-            err
-        })
-        .await?;
+    let value = connection.req_packed_command(&cmd).await.map_err(|err| {
+        trace!("get_slots error: {}", err);
+        err
+    })?;
     trace!("get_slots -> {:#?}", value);
     // Parse response.
     let mut result = Vec::with_capacity(2);
