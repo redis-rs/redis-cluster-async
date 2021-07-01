@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    error::Error,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex, MutexGuard,
@@ -65,8 +64,6 @@ pub struct RedisEnv {
     nodes: Vec<redis::aio::MultiplexedConnection>,
 }
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 impl RedisEnv {
     pub async fn new() -> Self {
         let _ = env_logger::try_init();
@@ -99,20 +96,20 @@ impl RedisEnv {
 
                         if master {
                             master_urls.push(url.to_string());
-                            let () = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                redis::Cmd::new()
-                                    .arg("FLUSHALL")
-                                    .query_async(&mut conn)
-                                    .map_err(BoxError::from),
-                            )
-                            .await
-                            .unwrap_or_else(|err| Err(BoxError::from(err)))?;
+                            let () =
+                                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                                    Ok(redis::Cmd::new()
+                                        .arg("FLUSHALL")
+                                        .query_async(&mut conn)
+                                        .await?)
+                                })
+                                .await
+                                .unwrap_or_else(|err| Err(anyhow::Error::from(err)))?;
                         }
 
                         nodes.push(conn);
                     }
-                    Ok::<_, BoxError>(())
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 match cleared_nodes {
@@ -142,7 +139,8 @@ impl RedisEnv {
         redis::cmd("CLUSTER")
             .arg("NODES")
             .query_async(redis_client)
-            .map_ok(|s: String| {
+            .await
+            .map(|s: String| {
                 s.lines()
                     .map(|line| {
                         let mut iter = line.split(' ');
@@ -163,7 +161,6 @@ impl RedisEnv {
                     })
                     .collect::<Vec<_>>()
             })
-            .await
     }
 }
 
@@ -290,14 +287,9 @@ impl FailoverEnv {
     }
 }
 
-async fn do_failover(
-    redis: &mut redis::aio::MultiplexedConnection,
-) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    cmd("CLUSTER")
-        .arg("FAILOVER")
-        .query_async(redis)
-        .err_into()
-        .await
+async fn do_failover(redis: &mut redis::aio::MultiplexedConnection) -> Result<(), anyhow::Error> {
+    cmd("CLUSTER").arg("FAILOVER").query_async(redis).await?;
+    Ok(())
 }
 
 fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
@@ -316,12 +308,13 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
                 async move {
                     if i == requests / 2 {
                         // Failover all the nodes, error only if all the failover requests error
-                        nodes.iter_mut().map(|node| do_failover(node))
+                        nodes
+                            .iter_mut()
+                            .map(|node| do_failover(node))
                             .collect::<stream::FuturesUnordered<_>>()
                             .fold(
-                                Err(Box::<dyn Error + Send + Sync>::from("None".to_string())),
-                                |acc: Result<(), Box<dyn Error + Send + Sync>>,
-                                 result: Result<(), Box<dyn Error + Send + Sync>>| async move {
+                                Err(anyhow::anyhow!("None")),
+                                |acc: Result<(), _>, result: Result<(), _>| async move {
                                     acc.or_else(|_| result)
                                 },
                             )
@@ -341,7 +334,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
                             .await?;
                         assert_eq!(res, i);
                         completed.set(completed.get() + 1);
-                        Ok(())
+                        Ok::<_, anyhow::Error>(())
                     }
                 }
             })
@@ -367,9 +360,10 @@ impl Connect for ErrorConnection {
     where
         T: IntoConnectionInfo + Send + 'a,
     {
-        MultiplexedConnection::connect(info)
-            .map_ok(|inner| ErrorConnection { inner })
-            .boxed()
+        Box::pin(async {
+            let inner = MultiplexedConnection::connect(info).await?;
+            Ok(ErrorConnection { inner })
+        })
     }
 }
 
