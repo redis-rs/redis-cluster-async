@@ -444,7 +444,7 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
     ) -> RedisResult<HashMap<String, C>> {
-        let connections = stream::iter(initial_nodes)
+        let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
                 let addr = match *info.addr {
                     ConnectionAddr::Tcp(ref host, port) => match &info.passwd {
@@ -454,7 +454,7 @@ where
                     _ => panic!("No reach."),
                 };
 
-                let result = connect_and_check(info.clone()).await;
+                let result = connect_and_check(info).await;
                 match result {
                     Ok(conn) => Some((addr, conn)),
                     Err(_) => None,
