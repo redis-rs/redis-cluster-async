@@ -933,9 +933,6 @@ impl Clone for Client {
     }
 }
 
-trait ImplRedisFuture<T>: Future<Output = RedisResult<T>> {}
-impl<T, F> ImplRedisFuture<T> for F where F: Future<Output = RedisResult<T>> {}
-
 pub trait Connect: Sized {
     fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
     where
