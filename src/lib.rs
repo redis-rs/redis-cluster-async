@@ -956,15 +956,14 @@ impl Connect for redis::aio::MultiplexedConnection {
     }
 }
 
-fn connect_and_check<'a, T, C>(info: T) -> impl ImplRedisFuture<C> + 'a
+async fn connect_and_check<T, C>(info: T) -> RedisResult<C>
 where
-    T: IntoConnectionInfo + Send + 'a,
+    T: IntoConnectionInfo + Send,
     C: ConnectionLike + Connect + Send + 'static,
 {
-    C::connect(info).and_then(|mut conn| async move {
-        check_connection(&mut conn).await?;
-        Ok(conn)
-    })
+    let mut conn = C::connect(info).await?;
+    check_connection(&mut conn).await?;
+    Ok(conn)
 }
 
 async fn check_connection<C>(conn: &mut C) -> RedisResult<()>
