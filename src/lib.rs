@@ -64,7 +64,6 @@ use std::{
 
 use crc16::*;
 use futures::{
-    channel::{mpsc, oneshot},
     future::{self, BoxFuture},
     prelude::*,
     ready, stream,
@@ -77,6 +76,7 @@ use redis::{
     aio::ConnectionLike, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
     RedisError, RedisFuture, RedisResult, Value,
 };
+use tokio::sync::{mpsc, oneshot};
 
 const SLOT_SIZE: usize = 16384;
 const DEFAULT_RETRIES: u32 = 16;
@@ -150,8 +150,15 @@ where
         retries: Option<u32>,
     ) -> RedisResult<Connection<C>> {
         Pipeline::new(initial_nodes, retries).await.map(|pipeline| {
-            let (tx, rx) = mpsc::channel::<Message<_>>(100);
-            tokio::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
+            let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
+
+            tokio::spawn(async move {
+                let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
+                    .map(Ok)
+                    .forward(pipeline)
+                    .await;
+            });
+
             Connection(tx)
         })
     }
