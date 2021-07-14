@@ -576,11 +576,8 @@ where
 
     fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
         if let Some((_, addr)) = self.slots.range(&slot..).next() {
-            if self.connections.contains_key(addr) {
-                return future::Either::Left(future::ready((
-                    addr.clone(),
-                    self.connections.get(addr).unwrap().clone(),
-                )));
+            if let Some(conn) = self.connections.get(addr) {
+                return future::Either::Left(future::ready((addr.clone(), conn.clone())));
             }
 
             // Create new connection.
