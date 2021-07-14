@@ -131,7 +131,7 @@ impl Client {
     #[doc(hidden)]
     pub async fn get_generic_connection<C>(&self) -> RedisResult<Connection<C>>
     where
-        C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
+        C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
     {
         Connection::new(&self.initial_nodes, self.retries).await
     }
@@ -143,7 +143,7 @@ pub struct Connection<C = redis::aio::MultiplexedConnection>(mpsc::Sender<Messag
 
 impl<C> Connection<C>
 where
-    C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
+    C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
 {
     async fn new(
         initial_nodes: &[ConnectionInfo],
@@ -165,9 +165,11 @@ where
 }
 
 type SlotMap = BTreeMap<u16, String>;
+type ConnectionFuture<C> = future::Shared<BoxFuture<'static, C>>;
+type ConnectionMap<C> = HashMap<String, ConnectionFuture<C>>;
 
 struct Pipeline<C> {
-    connections: HashMap<String, C>,
+    connections: ConnectionMap<C>,
     slots: SlotMap,
     state: ConnectionState<C>,
     in_flight_requests: stream::FuturesUnordered<
@@ -263,7 +265,7 @@ struct Message<C> {
 }
 
 type RecoverFuture<C> =
-    BoxFuture<'static, Result<(SlotMap, HashMap<String, C>), (RedisError, HashMap<String, C>)>>;
+    BoxFuture<'static, Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>;
 
 enum ConnectionState<C> {
     PollComplete,
@@ -429,7 +431,7 @@ where
 
 impl<C> Pipeline<C>
 where
-    C: ConnectionLike + Connect + Clone + Send + 'static,
+    C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     async fn new(initial_nodes: &[ConnectionInfo], retries: Option<u32>) -> RedisResult<Self> {
         let connections = Self::create_initial_connections(initial_nodes).await?;
@@ -450,7 +452,7 @@ where
 
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
-    ) -> RedisResult<HashMap<String, C>> {
+    ) -> RedisResult<ConnectionMap<C>> {
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
                 let addr = match *info.addr {
@@ -463,14 +465,14 @@ where
 
                 let result = connect_and_check(info).await;
                 match result {
-                    Ok(conn) => Some((addr, conn)),
+                    Ok(conn) => Some((addr, async { conn }.boxed().shared())),
                     Err(_) => None,
                 }
             })
             .buffer_unordered(initial_nodes.len())
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
-                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| async move {
+                |mut connections: ConnectionMap<C>, conn| async move {
                     connections.extend(conn);
                     connections
                 },
@@ -488,14 +490,15 @@ where
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(
         &mut self,
-    ) -> impl Future<Output = Result<(SlotMap, HashMap<String, C>), (RedisError, HashMap<String, C>)>>
+    ) -> impl Future<Output = Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>
     {
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
             let mut result = Ok(SlotMap::new());
             for (addr, conn) in connections.iter_mut() {
-                match get_slots(addr, &mut *conn)
+                let mut conn = conn.clone().await;
+                match get_slots(addr, &mut conn)
                     .await
                     .and_then(|v| Self::build_slot_map(v))
                 {
@@ -519,7 +522,8 @@ where
                     (connections, new_connections),
                     move |(mut connections, mut new_connections), addr| async move {
                         if !new_connections.contains_key(addr) {
-                            let new_connection = if let Some(mut conn) = connections.remove(addr) {
+                            let new_connection = if let Some(conn) = connections.remove(addr) {
+                                let mut conn = conn.await;
                                 match check_connection(&mut conn).await {
                                     Ok(_) => Some((addr.to_string(), conn)),
                                     Err(_) => match connect_and_check(addr.as_ref()).await {
@@ -533,7 +537,10 @@ where
                                     Err(_) => None,
                                 }
                             };
-                            new_connections.extend(new_connection);
+                            if let Some((addr, new_connection)) = new_connection {
+                                new_connections
+                                    .insert(addr, async { new_connection }.boxed().shared());
+                            }
                         }
                         (connections, new_connections)
                     },
@@ -574,47 +581,48 @@ where
         Ok(slot_map)
     }
 
-    fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
+    fn get_connection(&mut self, slot: u16) -> (String, ConnectionFuture<C>) {
         if let Some((_, addr)) = self.slots.range(&slot..).next() {
             if let Some(conn) = self.connections.get(addr) {
-                return future::Either::Left(future::ready((addr.clone(), conn.clone())));
+                return (addr.clone(), conn.clone());
             }
 
             // Create new connection.
             //
-            let random_conn = get_random_connection(&self.connections, None); // TODO Only do this lookup if the first check fails
-            let addr = addr.clone();
-            future::Either::Right(async move {
-                let result = connect_and_check(addr.as_ref()).await;
-                result
-                    .map(|conn| (addr, conn))
-                    .unwrap_or_else(|_| random_conn)
-            })
+            let (_, random_conn) = get_random_connection(&self.connections, None); // TODO Only do this lookup if the first check fails
+            let connection_future = {
+                let addr = addr.clone();
+                async move {
+                    match connect_and_check(addr.as_ref()).await {
+                        Ok(conn) => conn,
+                        Err(_) => random_conn.await,
+                    }
+                }
+            }
+            .boxed()
+            .shared();
+            self.connections
+                .insert(addr.clone(), connection_future.clone());
+            (addr.clone(), connection_future)
         } else {
             // Return a random connection
-            future::Either::Left(future::ready(get_random_connection(
-                &self.connections,
-                None,
-            )))
+            get_random_connection(&self.connections, None)
         }
     }
 
     fn try_request(
-        &self,
+        &mut self,
         info: &RequestInfo<C>,
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
         let cmd = info.cmd.clone();
-        let f = if info.excludes.len() > 0 || info.slot.is_none() {
-            future::Either::Left(future::ready(get_random_connection(
-                &self.connections,
-                Some(&info.excludes),
-            )))
+        let (addr, conn) = if info.excludes.len() > 0 || info.slot.is_none() {
+            get_random_connection(&self.connections, Some(&info.excludes))
         } else {
-            future::Either::Right(self.get_connection(info.slot.unwrap()))
+            self.get_connection(info.slot.unwrap())
         };
         async move {
-            let (addr, conn) = f.await;
+            let conn = conn.await;
             let result = cmd.exec(conn).await;
             (addr, result)
         }
@@ -722,7 +730,7 @@ where
 
 impl<C> Sink<Message<C>> for Pipeline<C>
 where
-    C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
+    C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
 {
     type Error = ();
 
@@ -970,9 +978,9 @@ where
 }
 
 fn get_random_connection<'a, C>(
-    connections: &'a HashMap<String, C>,
+    connections: &'a ConnectionMap<C>,
     excludes: Option<&'a HashSet<String>>,
-) -> (String, C)
+) -> (String, ConnectionFuture<C>)
 where
     C: Clone,
 {
