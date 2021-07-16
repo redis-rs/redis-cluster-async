@@ -99,7 +99,7 @@ impl Client {
 
         for info in initial_nodes {
             let info = info.into_connection_info()?;
-            if let ConnectionAddr::Unix(_) = *info.addr {
+            if let ConnectionAddr::Unix(_) = info.addr {
                 return Err(RedisError::from((ErrorKind::InvalidClientConfig,
                                              "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
             }
@@ -455,8 +455,8 @@ where
     ) -> RedisResult<ConnectionMap<C>> {
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
-                let addr = match *info.addr {
-                    ConnectionAddr::Tcp(ref host, port) => match &info.passwd {
+                let addr = match info.addr {
+                    ConnectionAddr::Tcp(ref host, port) => match &info.redis.password {
                         Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
                         None => format!("redis://{}:{}", host, port),
                     },
@@ -1136,9 +1136,7 @@ where
 }
 
 fn get_password(addr: &str) -> Option<String> {
-    redis::parse_redis_url(addr)
-        .ok()
-        .and_then(|url| url.password().map(|s| s.into()))
+    redis::parse_redis_url(addr).and_then(|url| url.password().map(|s| s.into()))
 }
 
 #[cfg(test)]
