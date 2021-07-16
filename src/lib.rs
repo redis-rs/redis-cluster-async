@@ -660,6 +660,13 @@ where
         if !self.pending_requests.is_empty() {
             let mut pending_requests = mem::take(&mut self.pending_requests);
             for request in pending_requests.drain(..) {
+                // Drop the request if noone is waiting for a response to free up resources for
+                // requests callers care about (load shedding). It will be ambigous whether the
+                // request actually goes through regardless.
+                if request.sender.is_closed() {
+                    continue;
+                }
+
                 let future = self.try_request(&request.info);
                 self.in_flight_requests.push(Box::pin(Request {
                     max_retries: self.retries,
