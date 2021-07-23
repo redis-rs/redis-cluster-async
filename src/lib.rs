@@ -84,6 +84,7 @@ const DEFAULT_RETRIES: u32 = 16;
 /// This is a Redis cluster client.
 pub struct Client {
     initial_nodes: Vec<ConnectionInfo>,
+    readonly: bool,
     retries: Option<u32>,
 }
 
@@ -108,6 +109,7 @@ impl Client {
 
         Ok(Client {
             initial_nodes: nodes,
+            readonly: false,
             retries: Some(DEFAULT_RETRIES),
         })
     }
@@ -119,13 +121,20 @@ impl Client {
         self
     }
 
+    /// Set readonly flag which tells that the client is willing to read
+    /// Default: false
+    pub fn readonly(&mut self, readonly: bool) -> &mut Self {
+        self.readonly = readonly;
+        self
+    }
+
     /// Open and get a Redis cluster connection.
     ///
     /// # Errors
     ///
     /// If it is failed to open connections and to create slots, an error is returned.
     pub async fn get_connection(&self) -> RedisResult<Connection> {
-        Connection::new(&self.initial_nodes, self.retries).await
+        Connection::new(&self.initial_nodes, self.readonly, self.retries).await
     }
 
     #[doc(hidden)]
@@ -133,7 +142,7 @@ impl Client {
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
     {
-        Connection::new(&self.initial_nodes, self.retries).await
+        Connection::new(&self.initial_nodes, self.readonly, self.retries).await
     }
 }
 
@@ -147,20 +156,23 @@ where
 {
     async fn new(
         initial_nodes: &[ConnectionInfo],
+        readonly: bool,
         retries: Option<u32>,
     ) -> RedisResult<Connection<C>> {
-        Pipeline::new(initial_nodes, retries).await.map(|pipeline| {
-            let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
+        Pipeline::new(initial_nodes, readonly, retries)
+            .await
+            .map(|pipeline| {
+                let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
 
-            tokio::spawn(async move {
-                let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
-                    .map(Ok)
-                    .forward(pipeline)
-                    .await;
-            });
+                tokio::spawn(async move {
+                    let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
+                        .map(Ok)
+                        .forward(pipeline)
+                        .await;
+                });
 
-            Connection(tx)
-        })
+                Connection(tx)
+            })
     }
 }
 
@@ -177,6 +189,7 @@ struct Pipeline<C> {
     >,
     refresh_error: Option<RedisError>,
     pending_requests: Vec<PendingRequest<Response, C>>,
+    readonly: bool,
     retries: Option<u32>,
 }
 
@@ -433,8 +446,12 @@ impl<C> Pipeline<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
-    async fn new(initial_nodes: &[ConnectionInfo], retries: Option<u32>) -> RedisResult<Self> {
-        let connections = Self::create_initial_connections(initial_nodes).await?;
+    async fn new(
+        initial_nodes: &[ConnectionInfo],
+        readonly: bool,
+        retries: Option<u32>,
+    ) -> RedisResult<Self> {
+        let connections = Self::create_initial_connections(initial_nodes, readonly).await?;
         let mut connection = Pipeline {
             connections,
             slots: Default::default(),
@@ -442,6 +459,7 @@ where
             refresh_error: None,
             pending_requests: Vec::new(),
             state: ConnectionState::PollComplete,
+            readonly,
             retries,
         };
         let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
@@ -452,6 +470,7 @@ where
 
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
+        readonly: bool,
     ) -> RedisResult<ConnectionMap<C>> {
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
@@ -463,7 +482,7 @@ where
                     _ => panic!("No reach."),
                 };
 
-                let result = connect_and_check(info).await;
+                let result = connect_and_check(info, readonly).await;
                 match result {
                     Ok(conn) => Some((addr, async { conn }.boxed().shared())),
                     Err(_) => None,
@@ -493,6 +512,7 @@ where
     ) -> impl Future<Output = Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>
     {
         let mut connections = mem::replace(&mut self.connections, Default::default());
+        let readonly = self.readonly;
 
         async move {
             let mut result = Ok(SlotMap::new());
@@ -500,7 +520,7 @@ where
                 let mut conn = conn.clone().await;
                 match get_slots(addr, &mut conn)
                     .await
-                    .and_then(|v| Self::build_slot_map(v))
+                    .and_then(|v| Self::build_slot_map(v, readonly))
                 {
                     Ok(s) => {
                         result = Ok(s);
@@ -526,13 +546,13 @@ where
                                 let mut conn = conn.await;
                                 match check_connection(&mut conn).await {
                                     Ok(_) => Some((addr.to_string(), conn)),
-                                    Err(_) => match connect_and_check(addr.as_ref()).await {
+                                    Err(_) => match connect_and_check(addr.as_ref(), readonly).await {
                                         Ok(conn) => Some((addr.to_string(), conn)),
                                         Err(_) => None,
                                     },
                                 }
                             } else {
-                                match connect_and_check(addr.as_ref()).await {
+                                match connect_and_check(addr.as_ref(), readonly).await {
                                     Ok(conn) => Some((addr.to_string(), conn)),
                                     Err(_) => None,
                                 }
@@ -550,7 +570,7 @@ where
         }
     }
 
-    fn build_slot_map(mut slots_data: Vec<Slot>) -> RedisResult<SlotMap> {
+    fn build_slot_map(mut slots_data: Vec<Slot>, readonly: bool) -> RedisResult<SlotMap> {
         slots_data.sort_by_key(|slot_data| slot_data.start);
         let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
             if prev_end != slot_data.start() {
@@ -575,7 +595,7 @@ where
         }
         let slot_map = slots_data
             .iter()
-            .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
+            .map(|slot_data| (slot_data.end(), get_addr(slot_data, readonly)))
             .collect();
         trace!("{:?}", slot_map);
         Ok(slot_map)
@@ -592,8 +612,9 @@ where
             let (_, random_conn) = get_random_connection(&self.connections, None); // TODO Only do this lookup if the first check fails
             let connection_future = {
                 let addr = addr.clone();
+                let readonly = self.readonly;
                 async move {
-                    match connect_and_check(addr.as_ref()).await {
+                    match connect_and_check(addr.as_ref(), readonly).await {
                         Ok(conn) => conn,
                         Err(_) => random_conn.await,
                     }
@@ -960,14 +981,27 @@ impl Connect for redis::aio::MultiplexedConnection {
     }
 }
 
-async fn connect_and_check<T, C>(info: T) -> RedisResult<C>
+async fn connect_and_check<T, C>(info: T, readonly: bool) -> RedisResult<C>
 where
     T: IntoConnectionInfo + Send,
     C: ConnectionLike + Connect + Send + 'static,
 {
     let mut conn = C::connect(info).await?;
     check_connection(&mut conn).await?;
+    if readonly {
+        readonly_connection(&mut conn).await?;
+    }
     Ok(conn)
+}
+
+async fn readonly_connection<C>(conn: &mut C) -> RedisResult<()>
+where
+    C: ConnectionLike + Send + 'static,
+{
+    let mut cmd = Cmd::new();
+    cmd.arg("READONLY");
+    cmd.query_async::<_, String>(conn).await?;
+    Ok(())
 }
 
 async fn check_connection<C>(conn: &mut C) -> RedisResult<()>
@@ -1137,6 +1171,20 @@ where
 
 fn get_password(addr: &str) -> Option<String> {
     redis::parse_redis_url(addr).and_then(|url| url.password().map(|s| s.into()))
+}
+
+fn get_addr(slot_data: &Slot, readonly: bool) -> String {
+    let mut rng = thread_rng();
+    if readonly {
+        let replicas = slot_data.replicas();
+        if replicas.is_empty() {
+            slot_data.master().to_string()
+        } else {
+            replicas.iter().choose(&mut rng).unwrap().to_string()
+        }
+    } else {
+        slot_data.master().to_string()
+    }
 }
 
 #[cfg(test)]
