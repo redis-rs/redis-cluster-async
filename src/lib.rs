@@ -123,7 +123,7 @@ impl Client {
 
     /// Set readonly flag which tells that the client is willing to read
     /// Default: false
-    pub fn readonly(&mut self, readonly: bool) -> &mut Self {
+    pub fn readonly(mut self, readonly: bool) -> Self {
         self.readonly = readonly;
         self
     }
