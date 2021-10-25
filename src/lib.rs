@@ -178,6 +178,7 @@ struct Pipeline<C> {
     refresh_error: Option<RedisError>,
     pending_requests: Vec<PendingRequest<Response, C>>,
     retries: Option<u32>,
+    tls: bool,
 }
 
 #[derive(Clone)]
@@ -434,6 +435,10 @@ where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     async fn new(initial_nodes: &[ConnectionInfo], retries: Option<u32>) -> RedisResult<Self> {
+        let tls = initial_nodes.iter().all(|c| match c.addr {
+            ConnectionAddr::TcpTls { .. } => true,
+            _ => false,
+        });
         let connections = Self::create_initial_connections(initial_nodes).await?;
         let mut connection = Pipeline {
             connections,
@@ -443,6 +448,7 @@ where
             pending_requests: Vec::new(),
             state: ConnectionState::PollComplete,
             retries,
+            tls,
         };
         let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
         connection.slots = slots;
@@ -460,13 +466,22 @@ where
                         Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
                         None => format!("redis://{}:{}", host, port),
                     },
+                    ConnectionAddr::TcpTls { ref host, port, insecure } => match &info.redis.password {
+                        Some(pw) if insecure => format!("rediss://:{}@{}:{}/#insecure", pw, host, port),
+                        Some(pw) => format!("rediss://:{}@{}:{}", pw, host, port),
+                        None if insecure => format!("rediss://{}:{}/#insecure", host, port),
+                        None => format!("rediss://{}:{}", host, port),
+                    },
                     _ => panic!("No reach."),
                 };
 
                 let result = connect_and_check(info).await;
                 match result {
                     Ok(conn) => Some((addr, async { conn }.boxed().shared())),
-                    Err(_) => None,
+                    Err(e) => {
+                        trace!("Failed to connect to initial node: {:?}", e);
+                        None
+                    },
                 }
             })
             .buffer_unordered(initial_nodes.len())
@@ -493,12 +508,13 @@ where
     ) -> impl Future<Output = Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>
     {
         let mut connections = mem::replace(&mut self.connections, Default::default());
+        let use_tls = self.tls;
 
         async move {
             let mut result = Ok(SlotMap::new());
             for (addr, conn) in connections.iter_mut() {
                 let mut conn = conn.clone().await;
-                match get_slots(addr, &mut conn)
+                match get_slots(addr, &mut conn, use_tls)
                     .await
                     .and_then(|v| Self::build_slot_map(v))
                 {
@@ -1053,7 +1069,7 @@ impl Slot {
 }
 
 // Get slot data from connection.
-async fn get_slots<C>(addr: &str, connection: &mut C) -> RedisResult<Vec<Slot>>
+async fn get_slots<C>(addr: &str, connection: &mut C, use_tls: bool) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
@@ -1108,9 +1124,10 @@ where
                         } else {
                             return None;
                         };
+                        let scheme = if use_tls { "rediss" } else { "redis" };
                         match &password {
-                            Some(pw) => Some(format!("redis://:{}@{}:{}", pw, ip, port)),
-                            None => Some(format!("redis://{}:{}", ip, port)),
+                            Some(pw) => Some(format!("{}://:{}@{}:{}", scheme, pw, ip, port)),
+                            None => Some(format!("{}://{}:{}", scheme, ip, port)),
                         }
                     } else {
                         None
