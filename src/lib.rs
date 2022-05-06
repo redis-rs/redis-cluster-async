@@ -224,7 +224,7 @@ impl<C> CmdArg<C> {
 
         fn slot_for_command(cmd: &Cmd) -> Option<u16> {
             match get_cmd_arg(cmd, 0) {
-                Some(b"EVAL") | Some(b"EVALSHA") | Some(b"XGROUP") => {
+                Some(b"EVAL") | Some(b"EVALSHA") => {
                     get_cmd_arg(cmd, 2).and_then(|key_count_bytes| {
                         let key_count_res = std::str::from_utf8(key_count_bytes)
                             .ok()
@@ -239,6 +239,7 @@ impl<C> CmdArg<C> {
                         })
                     })
                 }
+                Some(b"XGROUP") => get_cmd_arg(cmd, 2).map(|key| slot_for_key(key)),
                 Some(b"XREAD") | Some(b"XREADGROUP") => {
                     let pos = position(cmd, b"STREAMS")?;
                     get_cmd_arg(cmd, pos + 1).map(slot_for_key)
@@ -1120,6 +1121,7 @@ where
                         } else {
                             return None;
                         };
+
                         match &password {
                             Some(pw) => Some(format!("redis://:{}@{}:{}", pw, ip, port)),
                             None => Some(format!("redis://{}:{}", ip, port)),
