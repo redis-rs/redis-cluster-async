@@ -73,7 +73,7 @@ use pin_project_lite::pin_project;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
-    aio::ConnectionLike, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
+    aio::ConnectionLike, Arg, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo,
     RedisError, RedisFuture, RedisResult, Value,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -215,6 +215,14 @@ impl<C> CmdArg<C> {
                 redis::Arg::Cursor => None,
             })
         }
+
+        fn position(cmd: &Cmd, candidate: &[u8]) -> Option<usize> {
+            cmd.args_iter().position(|arg| match arg {
+                Arg::Simple(arg) => arg.eq_ignore_ascii_case(candidate),
+                _ => false,
+            })
+        }
+
         fn slot_for_command(cmd: &Cmd) -> Option<u16> {
             match get_cmd_arg(cmd, 0) {
                 Some(b"EVAL") | Some(b"EVALSHA") => {
@@ -231,6 +239,11 @@ impl<C> CmdArg<C> {
                             }
                         })
                     })
+                }
+                Some(b"XGROUP") => get_cmd_arg(cmd, 2).map(|key| slot_for_key(key)),
+                Some(b"XREAD") | Some(b"XREADGROUP") => {
+                    let pos = position(cmd, b"STREAMS")?;
+                    get_cmd_arg(cmd, pos + 1).map(slot_for_key)
                 }
                 Some(b"SCRIPT") => {
                     // TODO need to handle sending to all masters
