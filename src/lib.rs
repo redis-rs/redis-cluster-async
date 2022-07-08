@@ -475,26 +475,41 @@ where
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
                 let addr = match info.addr {
-                    ConnectionAddr::Tcp(ref host, port) => match &info.redis.password {
-                        Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
-                        None => format!("redis://{}:{}", host, port),
-                    },
-                    ConnectionAddr::TcpTls { ref host, port, insecure } => match &info.redis.password {
-                        Some(pw) if insecure => format!("rediss://:{}@{}:{}/#insecure", pw, host, port),
-                        Some(pw) => format!("rediss://:{}@{}:{}", pw, host, port),
-                        None if insecure => format!("rediss://{}:{}/#insecure", host, port),
-                        None => format!("rediss://{}:{}", host, port),
-                    },
+                    ConnectionAddr::Tcp(ref host, port) => {
+                        let addr = format!("redis://{}:{}", host, port);
+                        match &info.redis.password {
+                            Some(password) => set_password(addr, password),
+                            None => Some(addr),
+                        }
+                    }
+                    ConnectionAddr::TcpTls {
+                        ref host,
+                        port,
+                        insecure,
+                    } => {
+                        let addr = if insecure {
+                            format!("rediss://{}:{}", host, port)
+                        } else {
+                            format!("rediss://{}:{}/#insecure", host, port)
+                        };
+                        match &info.redis.password {
+                            Some(password) => set_password(addr, password),
+                            None => Some(addr),
+                        }
+                    }
                     _ => panic!("No reach."),
                 };
 
-                let result = connect_and_check(info).await;
-                match result {
-                    Ok(conn) => Some((addr, async { conn }.boxed().shared())),
-                    Err(e) => {
+                match (connect_and_check(info).await, addr) {
+                    (Ok(conn), Some(addr)) => Some((addr, async { conn }.boxed().shared())),
+                    (Err(e), _) => {
                         trace!("Failed to connect to initial node: {:?}", e);
                         None
-                    },
+                    }
+                    (Ok(_), None) => {
+                        trace!("Failed to parse addr, info addr");
+                        None
+                    }
                 }
             })
             .buffer_unordered(initial_nodes.len())
@@ -1138,9 +1153,10 @@ where
                             return None;
                         };
                         let scheme = if use_tls { "rediss" } else { "redis" };
+                        let addr = format!("{}://{}:{}", scheme, ip, port);
                         match &password {
-                            Some(pw) => Some(format!("{}://:{}@{}:{}", scheme, pw, ip, port)),
-                            None => Some(format!("{}://{}:{}", scheme, ip, port)),
+                            Some(pw) => set_password(addr, pw),
+                            None => Some(addr),
                         }
                     } else {
                         None
@@ -1167,6 +1183,15 @@ where
 
 fn get_password(addr: &str) -> Option<String> {
     redis::parse_redis_url(addr).and_then(|url| url.password().map(|s| s.into()))
+}
+
+fn set_password(addr: String, password: &str) -> Option<String> {
+    if let Ok(mut url) = url::Url::parse(&addr) {
+        if url.set_password(Some(password)).is_ok() {
+            return Some(url.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

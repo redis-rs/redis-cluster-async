@@ -623,6 +623,7 @@ dependencies = [
  "rand 0.8.4",
  "redis",
  "tokio",
+ "url",
 ]
 
 [[package]]
