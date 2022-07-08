@@ -19,6 +19,7 @@ rand = { version = "0.8", default-features = false, features = ["std", "std_rng"
 redis = { version = "0.21", features = ["tokio-comp"] }
 tokio = { version = "1", features = ["time"] }
 log = "0.4"
+url = "2.2.2"
 
 [dev-dependencies]
 anyhow = "1"
