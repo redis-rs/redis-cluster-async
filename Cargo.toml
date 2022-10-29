@@ -16,7 +16,7 @@ crc16 = "0.4"
 futures = "0.3"
 pin-project-lite = "0.2"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
-redis = { version = "0.21", features = ["tokio-comp"] }
+redis = { version = "0.21", features = ["tokio-comp", "tokio-native-tls-comp"] }
 tokio = { version = "1", features = ["time"] }
 log = "0.4"
 
