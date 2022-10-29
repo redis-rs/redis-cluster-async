@@ -179,6 +179,7 @@ struct Pipeline<C> {
     pending_requests: Vec<PendingRequest<Response, C>>,
     retries: Option<u32>,
     tls: bool,
+    insecure: bool
 }
 
 #[derive(Clone)]
@@ -452,6 +453,10 @@ where
             ConnectionAddr::TcpTls { .. } => true,
             _ => false,
         });
+        let insecure = initial_nodes.iter().all(|c| match c.addr {
+            ConnectionAddr::TcpTls { insecure, .. } => insecure,
+            _ => false,
+        });
         let connections = Self::create_initial_connections(initial_nodes).await?;
         let mut connection = Pipeline {
             connections,
@@ -462,6 +467,7 @@ where
             state: ConnectionState::PollComplete,
             retries,
             tls,
+            insecure
         };
         let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
         connection.slots = slots;
@@ -522,12 +528,13 @@ where
     {
         let mut connections = mem::replace(&mut self.connections, Default::default());
         let use_tls = self.tls;
+        let tls_insecure = self.insecure;
 
         async move {
             let mut result = Ok(SlotMap::new());
             for (addr, conn) in connections.iter_mut() {
                 let mut conn = conn.clone().await;
-                match get_slots(addr, &mut conn, use_tls)
+                match get_slots(addr, &mut conn, use_tls, tls_insecure)
                     .await
                     .and_then(|v| Self::build_slot_map(v))
                 {
@@ -1082,7 +1089,7 @@ impl Slot {
 }
 
 // Get slot data from connection.
-async fn get_slots<C>(addr: &str, connection: &mut C, use_tls: bool) -> RedisResult<Vec<Slot>>
+async fn get_slots<C>(addr: &str, connection: &mut C, use_tls: bool, tls_insecure: bool) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
@@ -1138,9 +1145,10 @@ where
                             return None;
                         };
                         let scheme = if use_tls { "rediss" } else { "redis" };
+                        let fragment = if use_tls && tls_insecure {"#insecure"} else {""};
                         match &password {
-                            Some(pw) => Some(format!("{}://:{}@{}:{}", scheme, pw, ip, port)),
-                            None => Some(format!("{}://{}:{}", scheme, ip, port)),
+                            Some(pw) => Some(format!("{}://:{}@{}:{}{}", scheme, pw, ip, port, fragment)),
+                            None => Some(format!("{}://{}:{}{}", scheme, ip, port, fragment)),
                         }
                     } else {
                         None
