@@ -26,3 +26,6 @@ once_cell = "1"
 tokio = { version = "1", features = ["macros", "full"] }
 env_logger = "0.8"
 proptest = "0.10"
+
+[features]
+tls = ["redis/tokio-native-tls-comp"]
