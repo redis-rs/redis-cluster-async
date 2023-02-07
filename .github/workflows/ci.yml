@@ -13,7 +13,7 @@ jobs:
         build: [stable]
         include:
         - build: stable
-          os: ubuntu-18.04
+          os: ubuntu-22.04
           rust: stable
     steps:
     - name: Checkout repository
