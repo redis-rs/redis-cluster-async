@@ -1,11 +1,11 @@
-//! This is a rust implementation for Redis cluster library.
+//! This library extends redis-rs library to be able to use Redis Cluster asynchronously.
+//! [`Client`] implements the `redis::ConnectionLike` and `redis::Commands` traits,
+//! so you can use redis-rs's access methods.
+//! If you want more information, read [the redis-rs documentation].
 //!
-//! This library extends redis-rs library to be able to use cluster.
-//! Client impletemts traits of ConnectionLike and Commands.
-//! So you can use redis-rs's access methods.
-//! If you want more information, read document of redis-rs.
+//! Note that this library currently does not have Pubsub features.
 //!
-//! Note that this library is currently not have features of Pubsub.
+//! [the redis-rs documentation]: https://docs.rs/redis
 //!
 //! # Example
 //! ```rust
@@ -25,7 +25,7 @@
 //! }
 //! ```
 //!
-//! # Pipelining
+//! ## Pipelining
 //! ```rust
 //! use redis_cluster_async::{Client, redis::pipe};
 //!
