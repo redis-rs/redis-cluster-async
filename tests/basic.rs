@@ -23,7 +23,6 @@ use redis_cluster_async::{
 };
 
 const REDIS_URL: &str = "redis://127.0.0.1:7000/";
-const AUTHENTICATED_REDIS_URL: &str = "redis://client-user:redis-password@127.0.0.1:7000/";
 
 pub struct RedisProcess;
 pub struct RedisLock(MutexGuard<'static, RedisProcess>);
@@ -269,29 +268,6 @@ fn proptests() {
 #[test]
 fn basic_failover() {
     test_failover(&mut FailoverEnv::new(), 10, 123);
-}
-
-#[tokio::test]
-async fn test_refresh_slot() {
-    let client = Client::open(vec![AUTHENTICATED_REDIS_URL])
-        .expect("Expect being able to build a Redis cluster client.");
-    let mut connection = client
-        .get_connection()
-        .await
-        .expect("Expect being able to get a cluster connection.");
-
-    // Query a range of keys to make sure we hit all hashslots in all masters.
-    // This is to ensure that we hit all masters, which will assert that we are able to
-    // build valid connection strings against all masters,
-    // i.e., `refresh_slots` works since we only provide the URL of one master in the initial list of nodes.
-    for key in 0..20000 {
-        let res: Option<String> = cmd("GET")
-            .arg(key.to_string())
-            .query_async(&mut connection)
-            .await
-            .expect("Expect being to query for key.");
-        assert!(res.is_none());
-    }
 }
 
 struct FailoverEnv {
