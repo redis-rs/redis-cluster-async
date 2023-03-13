@@ -1120,8 +1120,12 @@ where
     let mut result = Vec::with_capacity(2);
 
     if let Value::Bulk(items) = value {
+        // TODO optimize by calling parse_redis_url only once
+        // TODO these values could be cached
         let username = get_username(addr);
         let password = get_password(addr);
+        let host = get_hostname(addr);
+
         let mut iter = items.into_iter();
         while let Some(Value::Bulk(item)) = iter.next() {
             if item.len() < 3 {
@@ -1160,6 +1164,9 @@ where
                         } else {
                             return None;
                         };
+
+                        let ip : &str = if ip != "" {&ip} else {&host.as_ref().unwrap()};
+
                         Some(build_connection_string(
                             username.as_deref(),
                             password.as_deref(),
@@ -1237,6 +1244,10 @@ fn get_username(addr: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn get_hostname(addr: &str) -> Option<String> {
+    redis::parse_redis_url(addr).and_then(|url| url.host_str().map(String::from))
 }
 
 #[cfg(test)]
