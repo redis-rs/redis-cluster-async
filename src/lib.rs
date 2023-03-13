@@ -1165,7 +1165,7 @@ where
                             return None;
                         };
 
-                        let ip : &str = if ip != "" {&ip} else {&host.as_ref().unwrap()};
+                        let ip = if ip != "" {&ip} else {&host.as_ref().unwrap()};
 
                         Some(build_connection_string(
                             username.as_deref(),
