@@ -108,6 +108,17 @@ impl RedisEnv {
                                 .unwrap_or_else(|err| Err(anyhow::Error::from(err)))?;
                         }
 
+                        conn.acl_setuser_rules(
+                            "client-user",
+                            &[
+                                redis::acl::Rule::AllKeys,
+                                redis::acl::Rule::AllCommands,
+                                redis::acl::Rule::On,
+                                redis::acl::Rule::AddPass("redis-password".into()),
+                            ],
+                        )
+                        .await?;
+
                         nodes.push(conn);
                     }
                     Ok::<_, anyhow::Error>(())
@@ -123,7 +134,6 @@ impl RedisEnv {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-
         let client = Client::open(master_urls.iter().map(|s| &s[..]).collect()).unwrap();
 
         RedisEnv {
@@ -273,6 +283,9 @@ fn basic_failover() {
 
 #[tokio::test]
 async fn test_refresh_slot() {
+    let _env = RedisEnv::new().await;
+
+    let _ = env_logger::try_init();
     let client = Client::open(vec![AUTHENTICATED_REDIS_URL])
         .expect("Expect being able to build a Redis cluster client.");
     let connection = &client
