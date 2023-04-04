@@ -478,6 +478,7 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
     ) -> RedisResult<ConnectionMap<C>> {
+        let mut error = None;
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
                 let addr = match info.addr {
@@ -506,27 +507,36 @@ where
 
                 let result = connect_and_check(info).await;
                 match result {
-                    Ok(conn) => Some((addr, async { conn }.boxed().shared())),
+                    Ok(conn) => Ok((addr, async { conn }.boxed().shared())),
                     Err(e) => {
                         trace!("Failed to connect to initial node: {:?}", e);
-                        None
+                        Err(e)
                     }
                 }
             })
             .buffer_unordered(initial_nodes.len())
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
-                |mut connections: ConnectionMap<C>, conn| async move {
-                    connections.extend(conn);
-                    connections
+                |mut connections: ConnectionMap<C>, result| {
+                    match result {
+                        Ok((k, v)) => {
+                            connections.insert(k, v);
+                        }
+                        Err(err) => error = Some(err),
+                    }
+                    async move { connections }
                 },
             )
             .await;
         if connections.len() == 0 {
-            return Err(RedisError::from((
-                ErrorKind::IoError,
-                "Failed to create initial connections",
-            )));
+            if let Some(err) = error {
+                return Err(err);
+            } else {
+                return Err(RedisError::from((
+                    ErrorKind::IoError,
+                    "Failed to create initial connections",
+                )));
+            }
         }
         Ok(connections)
     }
