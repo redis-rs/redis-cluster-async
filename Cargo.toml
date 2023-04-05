@@ -16,7 +16,7 @@ crc16 = "0.4"
 futures = "0.3"
 pin-project-lite = "0.2"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
-redis = { version = "0.22", features = ["tokio-comp"] }
+redis = { version = "0.23", features = ["tokio-comp"] }
 tokio = { version = "1", features = ["time"] }
 log = "0.4"
 
@@ -24,8 +24,8 @@ log = "0.4"
 anyhow = "1"
 once_cell = "1"
 tokio = { version = "1", features = ["macros", "full"] }
-env_logger = "0.8"
-proptest = "0.10"
+env_logger = "0.10"
+proptest = "1"
 
 [features]
 tls = ["redis/tokio-native-tls-comp"]
