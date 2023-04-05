@@ -4,8 +4,8 @@ version = "0.7.2"
 authors = ["Markus Westerlind <marwes91@gmail.com>"]
 keywords = ["redis", "cluster", "database", "async"]
 description = "Async redis cluster driver for Rust."
-homepage = "https://github.com/Marwes/redis-cluster-async"
-repository = "https://github.com/Marwes/redis-cluster-async"
+homepage = "https://github.com/redis-rs/redis-cluster-async"
+repository = "https://github.com/redis-rs/redis-cluster-async"
 license = "MIT"
 readme = "README.md"
 
