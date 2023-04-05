@@ -24,5 +24,7 @@ jobs:
         rust-version: ${{ matrix.rust }}
     - run: cargo build --verbose
     - run: cargo doc --verbose
+    - name: Start cluster
+      run: '(./start_cluster.sh &); sleep 10;'
     - name: Run tests
-      run: '(./start_cluster.sh &); sleep 10; cargo test --verbose'
+      run: 'cargo test --verbose --all-features --all-targets'

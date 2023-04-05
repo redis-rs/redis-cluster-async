@@ -179,7 +179,7 @@ struct Pipeline<C> {
     pending_requests: Vec<PendingRequest<Response, C>>,
     retries: Option<u32>,
     tls: bool,
-    insecure: bool
+    insecure: bool,
 }
 
 #[derive(Clone)]
@@ -467,7 +467,7 @@ where
             state: ConnectionState::PollComplete,
             retries,
             tls,
-            insecure
+            insecure,
         };
         let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
         connection.slots = slots;
@@ -478,45 +478,65 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
     ) -> RedisResult<ConnectionMap<C>> {
+        let mut error = None;
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|info| async move {
                 let addr = match info.addr {
-                    ConnectionAddr::Tcp(ref host, port) => match &info.redis.password {
-                        Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
-                        None => format!("redis://{}:{}", host, port),
-                    },
-                    ConnectionAddr::TcpTls { ref host, port, insecure } => match &info.redis.password {
-                        Some(pw) if insecure => format!("rediss://:{}@{}:{}/#insecure", pw, host, port),
-                        Some(pw) => format!("rediss://:{}@{}:{}", pw, host, port),
-                        None if insecure => format!("rediss://{}:{}/#insecure", host, port),
-                        None => format!("rediss://{}:{}", host, port),
-                    },
+                    ConnectionAddr::Tcp(ref host, port) => build_connection_string(
+                        info.redis.username.as_deref(),
+                        info.redis.password.as_deref(),
+                        host,
+                        port as i64,
+                        false, // use_tls
+                        false, // tls_insecure
+                    ),
+                    ConnectionAddr::TcpTls {
+                        ref host,
+                        port,
+                        insecure,
+                    } => build_connection_string(
+                        info.redis.username.as_deref(),
+                        info.redis.password.as_deref(),
+                        host,
+                        port as i64,
+                        true,     // use_tls
+                        insecure, // tls_insecure
+                    ),
                     _ => panic!("No reach."),
                 };
 
                 let result = connect_and_check(info).await;
                 match result {
-                    Ok(conn) => Some((addr, async { conn }.boxed().shared())),
+                    Ok(conn) => Ok((addr, async { conn }.boxed().shared())),
                     Err(e) => {
                         trace!("Failed to connect to initial node: {:?}", e);
-                        None
-                    },
+                        Err(e)
+                    }
                 }
             })
             .buffer_unordered(initial_nodes.len())
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
-                |mut connections: ConnectionMap<C>, conn| async move {
-                    connections.extend(conn);
-                    connections
+                |mut connections: ConnectionMap<C>, result| {
+                    match result {
+                        Ok((k, v)) => {
+                            connections.insert(k, v);
+                        }
+                        Err(err) => error = Some(err),
+                    }
+                    async move { connections }
                 },
             )
             .await;
         if connections.len() == 0 {
-            return Err(RedisError::from((
-                ErrorKind::IoError,
-                "Failed to create initial connections",
-            )));
+            if let Some(err) = error {
+                return Err(err);
+            } else {
+                return Err(RedisError::from((
+                    ErrorKind::IoError,
+                    "Failed to create initial connections",
+                )));
+            }
         }
         Ok(connections)
     }
@@ -1089,7 +1109,12 @@ impl Slot {
 }
 
 // Get slot data from connection.
-async fn get_slots<C>(addr: &str, connection: &mut C, use_tls: bool, tls_insecure: bool) -> RedisResult<Vec<Slot>>
+async fn get_slots<C>(
+    addr: &str,
+    connection: &mut C,
+    use_tls: bool,
+    tls_insecure: bool,
+) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
@@ -1105,7 +1130,12 @@ where
     let mut result = Vec::with_capacity(2);
 
     if let Value::Bulk(items) = value {
+        // TODO optimize by calling parse_redis_url only once
+        // TODO these values could be cached
+        let username = get_username(addr);
         let password = get_password(addr);
+        let host = get_hostname(addr);
+
         let mut iter = items.into_iter();
         while let Some(Value::Bulk(item)) = iter.next() {
             if item.len() < 3 {
@@ -1144,12 +1174,21 @@ where
                         } else {
                             return None;
                         };
-                        let scheme = if use_tls { "rediss" } else { "redis" };
-                        let fragment = if use_tls && tls_insecure {"#insecure"} else {""};
-                        match &password {
-                            Some(pw) => Some(format!("{}://:{}@{}:{}{}", scheme, pw, ip, port, fragment)),
-                            None => Some(format!("{}://{}:{}{}", scheme, ip, port, fragment)),
-                        }
+
+                        let ip = if ip != "" {
+                            &*ip
+                        } else {
+                            &*host.as_ref().unwrap()
+                        };
+
+                        Some(build_connection_string(
+                            username.as_deref(),
+                            password.as_deref(),
+                            &ip,
+                            port,
+                            use_tls,
+                            tls_insecure,
+                        ))
                     } else {
                         None
                     }
@@ -1173,8 +1212,56 @@ where
     Ok(result)
 }
 
+fn build_connection_string(
+    username: Option<&str>,
+    password: Option<&str>,
+    host: &str,
+    port: i64,
+    use_tls: bool,
+    tls_insecure: bool,
+) -> String {
+    let scheme = if use_tls { "rediss" } else { "redis" };
+    let fragment = if use_tls && tls_insecure {
+        "#insecure"
+    } else {
+        ""
+    };
+    match (username, password) {
+        (Some(username), Some(pw)) => {
+            format!(
+                "{}://{}:{}@{}:{}{}",
+                scheme, username, pw, host, port, fragment
+            )
+        }
+        (None, Some(pw)) => {
+            format!("{}://:{}@{}:{}{}", scheme, pw, host, port, fragment)
+        }
+        (Some(username), None) => {
+            format!("{}://{}@{}:{}{}", scheme, username, host, port, fragment)
+        }
+        (None, None) => {
+            format!("{}://{}:{}{}", scheme, host, port, fragment)
+        }
+    }
+}
+
 fn get_password(addr: &str) -> Option<String> {
     redis::parse_redis_url(addr).and_then(|url| url.password().map(|s| s.into()))
+}
+
+fn get_username(addr: &str) -> Option<String> {
+    redis::parse_redis_url(addr).and_then(|url| {
+        let username = url.username();
+        if username != "" {
+            Some(url.username().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn get_hostname(addr: &str) -> Option<String> {
+    redis::parse_redis_url(addr).and_then(|url| url.host_str().map(String::from))
 }
 
 #[cfg(test)]
@@ -1234,5 +1321,37 @@ mod tests {
             ]),
             Some(5210),
         );
+    }
+
+    #[test]
+    fn test_get_username_password() {
+        let testcases: Vec<(&str, Option<String>, Option<String>)> = vec![
+            ("redis://127.0.0.1:7000", None, None),
+            (
+                "redis://:password@127.0.0.1:7000",
+                None,
+                Some("password".to_string()),
+            ),
+            (
+                "redis://username:password@127.0.0.1:7000",
+                Some("username".to_string()),
+                Some("password".to_string()),
+            ),
+            (
+                "redis://username:@127.0.0.1:7000",
+                Some("username".to_string()),
+                None,
+            ),
+            (
+                "redis://username@127.0.0.1:7000",
+                Some("username".to_string()),
+                None,
+            ),
+        ];
+
+        for (redis_url, username, password) in testcases {
+            assert_eq!(username, get_username(redis_url));
+            assert_eq!(password, get_password(redis_url));
+        }
     }
 }
