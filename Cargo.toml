@@ -1,6 +1,6 @@
 [package]
 name = "redis_cluster_async"
-version = "0.8.0"
+version = "0.8.1"
 authors = ["Markus Westerlind <marwes91@gmail.com>"]
 keywords = ["redis", "cluster", "database", "async"]
 description = "Async redis cluster driver for Rust."
