@@ -1,12 +1,18 @@
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![](http://meritbadge.herokuapp.com/redis_cluster_async)](https://crates.io/crates/redis_cluster_async)
 
+# ⚠️  DEPRECATED! ⚠️
+
+The functionality of this crate has been merged into the main [redis-rs](https://github.com/redis-rs/redis-rs) project.
+
+# ⚠️  DEPRECATED! ⚠️
+
 A Rust crate implementing a [Redis cluster](https://redis.io/topics/cluster-tutorial) client.
 
 Documentation is available at [here](https://docs.rs/redis_cluster_async/*/redis_cluster_async/).
 
-This library builds upon the [redis-rs](https://github.com/mitsuhiko/redis-rs) crate to enable working with a Redis cluster (instead of single Redis nodes).
+This library builds upon the [redis-rs](https://github.com/redis-rs/redis-rs) crate to enable working with a Redis cluster (instead of single Redis nodes).
 
-# Example
+## Example
 
 ```rust
 extern crate futures;
@@ -24,7 +30,7 @@ fn main() {
         .and_then(|connection| {
             cmd("SET").arg("test").arg("test_data").clone()
                 .query_async(connection)
-                .and_then(|(connection, ())| 
+                .and_then(|(connection, ())|
                     cmd("GET").arg("test")
                         .query_async(connection)
                 )
@@ -36,7 +42,7 @@ fn main() {
 }
 ```
 
-# Pipelining
+## Pipelining
 
 ```rust
 extern crate futures;
@@ -66,7 +72,7 @@ fn main() {
 }
 ```
 
-## Acknowledgements
+### Acknowledgements
 
 This project is built upon the synchronous redis cluster implementation in https://github.com/atuk721/redis-cluster-rs .
 
